@@ -5,57 +5,41 @@
 (in-package :pgloader.parser)
 
 ;;;
-;;; Materialize views by copying their data over, allows for doing advanced
-;;; ETL processing by having parts of the processing happen on the MySQL
-;;; query side.
+;;; MySQL options
 ;;;
-(defrule view-name (and (alpha-char-p character)
-			(* (or (alpha-char-p character)
-			       (digit-char-p character)
-			       #\_)))
-  (:text t))
+(defrule mysql-option (or option-on-error-stop
+                          option-on-error-resume-next
+                          option-workers
+                          option-concurrency
+                          option-batch-rows
+                          option-batch-size
+                          option-prefetch-rows
+                          option-max-parallel-create-index
+                          option-single-reader
+                          option-multiple-readers
+                          option-rows-per-range
+			  option-reindex
+                          option-truncate
+                          option-disable-triggers
+			  option-data-only
+			  option-schema-only
+			  option-include-drop
+                          option-drop-schema
+			  option-create-tables
+			  option-create-indexes
+			  option-index-names
+			  option-reset-sequences
+			  option-foreign-keys
+			  option-identifiers-case))
 
-(defrule view-sql (and kw-as dollar-quoted)
-  (:destructure (as sql) (declare (ignore as)) sql))
-
-(defrule view-definition (and view-name (? view-sql))
-  (:destructure (name sql) (cons name sql)))
-
-(defrule another-view-definition (and comma view-definition)
-  (:lambda (source)
-    (bind (((_ view) source)) view)))
-
-(defrule views-list (and view-definition (* another-view-definition))
-  (:lambda (vlist)
-    (destructuring-bind (view1 views) vlist
-      (list* view1 views))))
-
-(defrule materialize-all-views (and kw-materialize kw-all kw-views)
-  (:constant :all))
-
-(defrule materialize-view-list (and kw-materialize kw-views views-list)
-  (:destructure (mat views list) (declare (ignore mat views)) list))
-
-(defrule materialize-views (or materialize-view-list materialize-all-views)
-  (:lambda (views)
-    (cons :views views)))
+(defrule mysql-options (and kw-with
+                            (and mysql-option (* (and comma mysql-option))))
+  (:function flatten-option-list))
 
 
 ;;;
 ;;; Including only some tables or excluding some others
 ;;;
-(defrule namestring-or-regex (or quoted-namestring quoted-regex))
-
-(defrule another-namestring-or-regex (and comma namestring-or-regex)
-  (:lambda (source)
-    (bind (((_ re) source)) re)))
-
-(defrule filter-list-matching
-    (and namestring-or-regex (* another-namestring-or-regex))
-  (:lambda (source)
-    (destructuring-bind (filter1 filters) source
-      (list* filter1 filters))))
-
 (defrule including-matching
     (and kw-including kw-only kw-table kw-names kw-matching filter-list-matching)
   (:lambda (source)
@@ -85,33 +69,68 @@
 
 
 ;;;
+;;; MySQL SET parameters, because sometimes we need that
+;;;
+(defrule mysql-gucs (and kw-set kw-mysql kw-parameters generic-option-list)
+  (:lambda (mygucs) (cons :mysql-gucs (fourth mygucs))))
+
+
+;;;
 ;;; Allow clauses to appear in any order
 ;;;
 (defrule load-mysql-optional-clauses (* (or mysql-options
+                                            mysql-gucs
                                             gucs
                                             casts
+                                            alter-table
+                                            alter-schema
                                             materialize-views
                                             including-matching
                                             excluding-matching
                                             decoding-tables-as
                                             before-load
-                                            after-load))
+                                            after-load
+                                            distribute-commands))
   (:lambda (clauses-list)
     (alexandria:alist-plist clauses-list)))
 
 (defrule mysql-prefix "mysql://" (:constant (list :type :mysql)))
 
+(defrule mysql-dsn-option-usessl-true  "true"  (:constant :yes))
+(defrule mysql-dsn-option-usessl-false "false" (:constant :no))
+
+(defrule mysql-dsn-option-usessl (and "useSSL" "="
+                                      (or mysql-dsn-option-usessl-true
+                                          mysql-dsn-option-usessl-false))
+  (:lambda (ssl)
+    (cons :use-ssl (third ssl))))
+
+(defrule mysql-dsn-option (or dsn-option-ssl
+                              mysql-dsn-option-usessl
+                              dsn-option-host
+                              dsn-option-port
+                              dsn-option-dbname
+                              dsn-option-user
+                              dsn-option-pass
+                              dsn-option-table-name))
+
+(defrule mysql-dsn-options (and "?" (and mysql-dsn-option
+                                         (* (and "&" mysql-dsn-option))))
+  (:lambda (opts) (cdr (flatten-option-list opts))))
+
 (defrule mysql-uri (and mysql-prefix
                         (? dsn-user-password)
                         (? dsn-hostname)
-                        dsn-dbname)
+                        dsn-dbname
+                        (? mysql-dsn-options))
   (:lambda (uri)
     (destructuring-bind (&key type
                               user
 			      password
 			      host
 			      port
-			      dbname)
+			      dbname
+                              (use-ssl :no))
         (apply #'append uri)
       ;; Default to environment variables as described in
       ;;  http://dev.mysql.com/doc/refman/5.0/en/environment-variables.html
@@ -122,19 +141,10 @@
                      :host (or host     (getenv-default "MYSQL_HOST" "localhost"))
                      :port (or port     (parse-integer
                                          (getenv-default "MYSQL_TCP_PORT" "3306")))
-                     :name dbname))))
+                     :name dbname
+                     :use-ssl use-ssl))))
 
-(defrule get-mysql-uri-from-environment-variable (and kw-getenv name)
-  (:lambda (p-e-v)
-    (bind (((_ varname) p-e-v))
-      (let ((connstring (getenv-default varname)))
-        (unless connstring
-          (error "Environment variable ~s is unset." varname))
-        (parse 'mysql-uri connstring)))))
-
-(defrule mysql-source (and kw-load kw-database kw-from
-                           (or mysql-uri
-                               get-mysql-uri-from-environment-variable))
+(defrule mysql-source (and kw-load kw-database kw-from mysql-uri)
   (:lambda (source) (bind (((_ _ _ uri) source)) uri)))
 
 (defrule load-mysql-command (and mysql-source target
@@ -145,63 +155,74 @@
 
 
 ;;; LOAD DATABASE FROM mysql://
+(defun lisp-code-for-mysql-dry-run (my-db-conn pg-db-conn)
+  `(lambda ()
+     (log-message :log "DRY RUN, only checking connections.")
+     (check-connection ,my-db-conn)
+     (check-connection ,pg-db-conn)))
+
 (defun lisp-code-for-loading-from-mysql (my-db-conn pg-db-conn
                                          &key
-                                           gucs casts views before after
-                                           ((:mysql-options options))
+                                           gucs mysql-gucs
+                                           casts views before after options
+                                           alter-table alter-schema distribute
                                            ((:including incl))
                                            ((:excluding excl))
-                                           ((:decoding decoding-as)))
+                                           ((:decoding decoding-as))
+                                           &allow-other-keys)
   `(lambda ()
-     (let* ((state-before  (pgloader.utils:make-pgstate))
-            (*state*       (or *state* (pgloader.utils:make-pgstate)))
-            (state-idx     (pgloader.utils:make-pgstate))
-            (state-after   (pgloader.utils:make-pgstate))
-            (*default-cast-rules* ',*mysql-default-cast-rules*)
+     (let* ((*default-cast-rules* ',*mysql-default-cast-rules*)
             (*cast-rules*         ',casts)
+            (*decoding-as*        ',decoding-as)
+            (*mysql-settings*     ',mysql-gucs)
+            (on-error-stop        (getf ',options :on-error-stop t))
             ,@(pgsql-connection-bindings pg-db-conn gucs)
             ,@(batch-control-bindings options)
             ,@(identifier-case-binding options)
             (source
-             (make-instance 'pgloader.mysql::copy-mysql
+             (make-instance 'copy-mysql
                             :target-db ,pg-db-conn
                             :source-db ,my-db-conn)))
 
-       ,(sql-code-block pg-db-conn 'state-before before "before load")
+       ,(sql-code-block pg-db-conn :pre before "before load")
 
-       (pgloader.mysql:copy-database source
-                                     :including ',incl
-                                     :excluding ',excl
-                                     :decoding-as ',decoding-as
-                                     :materialize-views ',views
-                                     :state-before state-before
-                                     :state-after state-after
-                                     :state-indexes state-idx
-                                     ,@(remove-batch-control-option options))
+       (copy-database source
+                      :including ',incl
+                      :excluding ',excl
+                      :materialize-views ',views
+                      :alter-table ',alter-table
+                      :alter-schema ',alter-schema
+                      :distribute ',distribute
+                      :set-table-oids t
+                      :on-error-stop on-error-stop
+                      ,@(remove-batch-control-option options))
 
-       ,(sql-code-block pg-db-conn 'state-after after "after load")
-
-       (report-full-summary "Total import time" *state*
-                            :before   state-before
-                            :finally  state-after
-                            :parallel state-idx))))
+       ,(sql-code-block pg-db-conn :post after "after load"))))
 
 (defrule load-mysql-database load-mysql-command
   (:lambda (source)
     (destructuring-bind (my-db-uri
                          pg-db-uri
                          &key
-                         gucs casts views before after
-                         mysql-options including excluding decoding)
+                         gucs mysql-gucs casts views before after options
+                         alter-table alter-schema distribute
+                         including excluding decoding)
         source
-      (lisp-code-for-loading-from-mysql my-db-uri pg-db-uri
-                                        :gucs gucs
-                                        :casts casts
-                                        :views views
-                                        :before before
-                                        :after after
-                                        :mysql-options mysql-options
-                                        :including including
-                                        :excluding excluding
-                                        :decoding decoding))))
+      (cond (*dry-run*
+             (lisp-code-for-mysql-dry-run my-db-uri pg-db-uri))
+            (t
+             (lisp-code-for-loading-from-mysql my-db-uri pg-db-uri
+                                               :gucs gucs
+                                               :mysql-gucs mysql-gucs
+                                               :casts casts
+                                               :views views
+                                               :before before
+                                               :after after
+                                               :options options
+                                               :alter-table alter-table
+                                               :alter-schema alter-schema
+                                               :distribute distribute
+                                               :including including
+                                               :excluding excluding
+                                               :decoding decoding))))))
 

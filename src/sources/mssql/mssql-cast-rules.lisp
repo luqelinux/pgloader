@@ -2,14 +2,23 @@
 ;;; Tools to handle MS SQL data type casting rules
 ;;;
 
-(in-package :pgloader.mssql)
+(in-package :pgloader.source.mssql)
 
 (defparameter *mssql-default-cast-rules*
   `((:source (:type "char")      :target (:type "text" :drop-typemod t))
     (:source (:type "nchar")     :target (:type "text" :drop-typemod t))
     (:source (:type "varchar")   :target (:type "text" :drop-typemod t))
     (:source (:type "nvarchar")  :target (:type "text" :drop-typemod t))
-    (:source (:type "xml")       :target (:type "text" :drop-typemod t))
+    (:source (:type "ntext")     :target (:type "text" :drop-typemod t))
+    (:source (:type "xml")       :target (:type "xml" :drop-typemod t))
+
+    (:source (:type "int" :auto-increment t)
+             :target (:type "bigserial" :drop-default t))
+
+    (:source (:type "tinyint") :target (:type "smallint"))
+
+    (:source (:type "tinyint" :auto-increment t)
+             :target (:type "serial"))
 
     (:source (:type "bit") :target (:type "boolean")
              :using pgloader.transforms::sql-server-bit-to-boolean)
@@ -22,8 +31,6 @@
 
     (:source (:type "geography") :target (:type "bytea")
          :using pgloader.transforms::byte-vector-to-bytea)
-
-    (:source (:type "tinyint") :target (:type "smallint"))
 
     (:source (:type "float") :target (:type "float")
              :using pgloader.transforms::float-to-string)
@@ -49,9 +56,13 @@
     (:source (:type "binary") :target (:type "bytea")
              :using pgloader.transforms::byte-vector-to-bytea)
 
+    (:source (:type "image") :target (:type "bytea")
+             :using pgloader.transforms::byte-vector-to-bytea)
+
     (:source (:type "varbinary") :target (:type "bytea")
              :using pgloader.transforms::byte-vector-to-bytea)
 
+    (:source (:type "smalldatetime") :target (:type "timestamptz"))
     (:source (:type "datetime") :target (:type "timestamptz"))
     (:source (:type "datetime2") :target (:type "timestamptz")))
   "Data Type Casting to migrate from MSSQL to PostgreSQL")
@@ -77,14 +88,13 @@
   datetime-precision
   character-set-name collation-name)
 
+(defmethod field-name ((field mssql-column) &key)
+  (mssql-column-name field))
+
 (defmethod mssql-column-ctype ((col mssql-column))
   "Build the ctype definition from the full mssql-column information."
   (let ((type (mssql-column-type col)))
-    (cond ((and (string= type "int")
-                (mssql-column-identity col))
-           "bigserial")
-
-          ((member type '("float" "real") :test #'string=)
+    (cond ((member type '("float" "real") :test #'string=)
            ;; see https://msdn.microsoft.com/en-us/library/ms173773.aspx
            ;; scale is supposed to be nil, and useless in PostgreSQL, so we
            ;; just ignore it
@@ -92,34 +102,70 @@
 
           ((member type '("decimal" "numeric" ) :test #'string=)
            ;; https://msdn.microsoft.com/en-us/library/ms187746.aspx
-           (format nil "~a(~a,~a)"
-                   type
-                   (mssql-column-numeric-precision col)
-                   (mssql-column-numeric-scale col)))
+           (cond ((null (mssql-column-numeric-precision col))
+                  type)
+                 (t
+                  (format nil "~a(~a,~a)"
+                          type
+                          (mssql-column-numeric-precision col)
+                          (or (mssql-column-numeric-scale col) 0)))))
+
+          ((member type '("char" "nchar" "varchar" "nvarchar" "binary")
+                   :test #'string=)
+           ;; the user might have a CAST rule with keep typemod, so we need
+           ;; to deal with character-maximum-length for now
+
+           (if (= -1 (mssql-column-character-maximum-length col))
+               type
+               (format nil "~a(~a)"
+                       type (mssql-column-character-maximum-length col))))
 
           (t type))))
 
-(defmethod format-pgsql-column ((col mssql-column))
-  "Return a string representing the PostgreSQL column definition."
-  (let* ((column-name (apply-identifier-case (mssql-column-name col)))
-	 (type-definition
-	  (with-slots (schema table-name name type default nullable)
-	      col
-            (declare (ignore schema))   ; FIXME
-            (let ((ctype (mssql-column-ctype col)))
-              (cast table-name name type ctype default nullable nil)))))
-    (format nil "~a ~22t ~a" column-name type-definition)))
+(defmethod cast ((field mssql-column) &key &allow-other-keys)
+  "Return the PostgreSQL type definition from given MS SQL column definition."
+  (with-slots (schema table-name name type default nullable)
+      field
+    (declare (ignore schema))           ; FIXME
+    (let* ((ctype (mssql-column-ctype field))
+           (extra (when (mssql-column-identity field) :auto-increment))
+           (pgcol
+            (apply-casting-rules table-name name type ctype default nullable extra)))
+      ;; the MS SQL driver smartly maps data to the proper CL type, but the
+      ;; pgloader API only wants to see text representations to send down the
+      ;; COPY protocol.
+      (unless (column-transform pgcol)
+        (setf (column-transform pgcol)
+              (lambda (val) (if val (format nil "~a" val) :null))))
 
-(defun cast-mssql-column-definition-to-pgsql (mssql-column)
-  "Return the PostgreSQL column definition from the MS SQL one."
-  (multiple-value-bind (column fn)
-      (with-slots (schema table-name name type default nullable)
-          mssql-column
-        (declare (ignore schema))       ; FIXME
-        (let ((ctype (mssql-column-ctype mssql-column)))
-          (cast table-name name type ctype default nullable nil)))
+      ;; normalize default values
+      ;; see pgloader.psql:*pgsql-default-values*
+      (let ((default (column-default pgcol)))
+        (setf (column-default pgcol)
+              (cond
+                ((and (null default) (column-nullable pgcol))
+                 :null)
 
-    ;; the MS SQL driver smartly maps data to the proper CL type, but the
-    ;; pgloader API only wants to see text representations to send down the
-    ;; COPY protocol.
-    (values column (or fn (lambda (val) (if val (format nil "~a" val) :null))))))
+                ((and (stringp default) (string= "NULL" default))
+                 :null)
+
+                ;; fix stupid N'' behavior from MS SQL column default
+                ((and (stringp default)
+                      (uiop:string-enclosed-p "N'" default "'"))
+                 (subseq default 2 (+ (length default) -1)))
+
+                ((and (stringp default)
+                      ;; address CURRENT_TIMESTAMP(6) and other spellings
+                      (or (uiop:string-prefix-p "CURRENT_TIMESTAMP" default)
+                          (string= "CURRENT TIMESTAMP" default)))
+                 :current-timestamp)
+
+                ((and (stringp default)
+                      (or (string= "newid()" default)
+                          (string= "newsequentialid()" default)
+                          (string= "GENERATE_UUID" default)))
+                 :generate-uuid)
+
+                (t (column-default pgcol)))))
+      pgcol)))
+

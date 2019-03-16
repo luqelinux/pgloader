@@ -1,5 +1,9 @@
 # PGLoader
 
+[![Build Status](https://travis-ci.org/dimitri/pgloader.svg?branch=master)](https://travis-ci.org/dimitri/pgloader)
+
+[![Join the chat at https://gitter.im/dimitri/pgloader](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/dimitri/pgloader?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+
 pgloader is a data loading tool for PostgreSQL, using the `COPY` command.
 
 Its main advantage over just using `COPY` or `\copy`, and over using a
@@ -56,98 +60,125 @@ pgloader is available under [The PostgreSQL Licence](http://www.postgresql.org/a
 
 ## INSTALL
 
+You can install pgloader directly from
+[apt.postgresql.org](https://wiki.postgresql.org/wiki/Apt) and from official
+debian repositories, see
+[packages.debian.org/pgloader](https://packages.debian.org/search?keywords=pgloader).
+
+    $ apt-get install pgloader
+
+You can also use a **docker** image for pgloader at
+<https://hub.docker.com/r/dimitri/pgloader/>:
+
+    $ docker pull dimitri/pgloader
+    $ docker run --rm --name pgloader dimitri/pgloader:latest pgloader --version
+    $ docker run --rm --name pgloader dimitri/pgloader:latest pgloader --help
+
+## Build from sources
+
 pgloader is now a Common Lisp program, tested using the
-[SBCL](http://sbcl.org/) (>= 1.1.14) and
+[SBCL](http://sbcl.org/) (>= 1.2.5) and
 [Clozure CL](http://ccl.clozure.com/) implementations with
 [Quicklisp](http://www.quicklisp.org/beta/).
+
+When building from sources, you should always build from the current git
+`HEAD` as it's basically the only source that is managed in a way to ensure
+it builds aginst current set of dependencies versions.
+
+### Building from sources on debian
 
     $ apt-get install sbcl unzip libsqlite3-dev make curl gawk freetds-dev libzip-dev
     $ cd /path/to/pgloader
 	$ make pgloader
 	$ ./build/bin/pgloader --help
 
-You can also fetch pre-made binary packages at
-[pgloader.io](http://pgloader.io/download.html).
+### Building from sources on macOS
 
-## Testing a new feature
+When using [brew](https://brew.sh), it should be a simple `brew install
+--HEAD pgloader`.
 
-Being a Common Lisp program, pgloader is able to *upgrade itself* at run
-time, and provides the command-line option `--self-upgrade` that just does
-that.
+When using [macports](https://www.macports.org), then we have a situation to
+deal with with shared objects pgloader depends on, as reported in issue #161
+at <https://github.com/dimitri/pgloader/issues/161#issuecomment-201162647>:
 
-If you want to test the current repository version (or any checkout really),
-it's possible to clone the sources then load them with an older pgloader
-release:
+> I was able to get a clean build without having to disable compression after
+> symlinking /usr/local/lib to /opt/local/lib. Note that I did not have
+> anything installed to /usr/local/lib so I didn't lose anything here.
 
-    $ /usr/bin/pgloader --version
-    pgloader version "3.0.99"
-    compiled with SBCL 1.1.17
-    
-    $ git clone https://github.com/dimitri/pgloader.git /tmp/pgloader
-    $ /usr/bin/pgloader --self-upgrade /tmp/pgloader --version
-    Self-upgrading from sources at "/tmp/pgloader/"
-    pgloader version "3.0.fecae2c"
-    compiled with SBCL 1.1.17
+### Building from sources on Windows
 
-Here, the code from the *git clone* will be used at run-time. Self-upgrade
-is done first, then the main program entry point is called again with the
-new coded loaded in.
+Building pgloader on Windows is supported, thanks to Common Lisp
+implementations being available on that platform, and to the Common Lisp
+Standard for making it easy to write actually portable code.
 
-Please note that the *binary* file (`/usr/bin/pgloader` or
-`./build/bin/pgloader`) is not modified in-place, so that if you want to run
-the same upgraded code again you will have to use the `--self-upgrade`
-command again. It might warrant for an option rename before `3.1.0` stable
-release.
+It is recommended to have a look at the issues labelled with *Windows
+support* if you run into trouble when building
+pgloader:
 
-## The pgloader.lisp script
+<https://github.com/dimitri/pgloader/issues?utf8=✓&q=label%3A%22Windows%20support%22%20>
 
-Now you can use the `#!` script or build a self-contained binary executable
-file, as shown below.
+### Building Docker image from sources
 
-    ./pgloader.lisp --help
+You can build a Docker image from source using SBCL by default:
 
-Each time you run the `pgloader` command line, it will check that all its
-dependencies are installed and compiled and if that's not the case fetch
-them from the internet and prepare them (thanks to *Quicklisp*). So please
-be patient while that happens and make sure we can actually connect and
-download the dependencies.
+  $ docker build .
 
-## Build Self-Contained binary file
+Or Clozure CL (CCL):
+
+  $ docker build -f Dockerfile.ccl .
+
+## More options when building from source
 
 The `Makefile` target `pgloader` knows how to produce a Self Contained
-Binary file for pgloader, named `pgloader.exe`:
+Binary file for pgloader, found at `./build/bin/pgloader`:
 
     $ make pgloader
 
 By default, the `Makefile` uses [SBCL](http://sbcl.org/) to compile your
-binary image, though it's possible to also build using
+binary image, though it's possible to build using
 [CCL](http://ccl.clozure.com/).
 
     $ make CL=ccl pgloader
 
-Note that the `Makefile` uses the `--compress-core` option when using SBCL,
-that should be enabled in your local copy of `SBCL`. If that's not the case,
-it's probably because you did compile and install `SBCL` yourself, so that
-you have a decently recent version to use. Then you need to compile it with
-the `--with-sb-core-compression` option.
-
-You can also remove the `--compress-core` option that way:
+If using `SBCL` and it supports core compression, the make process will
+use it to generate a smaller binary.  To force disabling core
+compression, you may use:
 
     $ make COMPRESS_CORE=no pgloader
 
 The `--compress-core` is unique to SBCL, so not used when `CC` is different
 from the `sbcl` value.
 
+You can also tweak the default amount of memory that the `pgloader` image
+will allow itself using when running through your data (don't ask for more
+than your current RAM tho):
+
+    $ make DYNSIZE=8192 pgloader
+
 The `make pgloader` command when successful outputs a `./build/bin/pgloader`
 file for you to use.
 
 ## Usage
 
-Give as many command files that you need to pgloader:
+You can either give a command file to pgloader or run it all from the
+command line, see the
+[pgloader quick start](https://pgloader.readthedocs.io/en/latest/tutorial/tutorial.html#pgloader-quick-start) on
+<https://pgloader.readthedocs.io> for more details.
 
     $ ./build/bin/pgloader --help
     $ ./build/bin/pgloader <file.load>
-	
+
+For example, for a full migration from SQLite:
+
+    $ createdb newdb
+    $ pgloader ./test/sqlite/sqlite.db postgresql:///newdb
+
+Or for a full migration from MySQL, including schema definition (tables,
+indexes, foreign keys, comments) and parallel loading of the corrected data:
+
+    $ createdb pagila
+    $ pgloader mysql://user@localhost/sakila postgresql:///pagila
+
 See the documentation file `pgloader.1.md` for details. You can compile that
 file into a manual page or an HTML page thanks to the `ronn` application:
 

@@ -3,7 +3,7 @@
 ;;;
 ;;; http://www-01.ibm.com/support/knowledgecenter/SSEPGG_10.5.0/com.ibm.db2.luw.admin.dm.doc/doc/r0004667.html
 
-(in-package :pgloader.ixf)
+(in-package :pgloader.source.ixf)
 
 (defclass ixf-connection (fd-connection) ()
   (:documentation "pgloader connection parameters for IXF files."))
@@ -24,6 +24,9 @@
   (setf (conn-handle ixfconn) nil)
   ixfconn)
 
+(defmethod clone-connection ((c ixf-connection))
+  (change-class (call-next-method c) 'ixf-connection))
+
 (defvar *ixf-pgsql-type-mapping*
   '((#. ixf:+smallint+  . "smallint")
     (#. ixf:+integer+   . "integer")
@@ -37,29 +40,62 @@
     (#. ixf:+time+      . "time")
 
     (#. ixf:+char+      . "text")
-    (#. ixf:+varchar+   . "text")))
+    (#. ixf:+varchar+   . "text")
+
+    (#. ixf:+blob-location-spec+   . "bytea")
+    (#. ixf:+dbblob-location-spec+ . "bytea")
+    (#. ixf:+dbclob-location-spec+ . "text")))
 
 (defun cast-ixf-type (ixf-type)
   "Return the PostgreSQL type name for a given IXF type name."
-  (cdr (assoc ixf-type *ixf-pgsql-type-mapping*)))
+  (let ((pgtype
+         (cdr (assoc ixf-type *ixf-pgsql-type-mapping*))))
+    (unless pgtype
+      (error "IXF Type mapping unknown for: ~d" ixf-type))
+    pgtype))
 
-(defmethod format-pgsql-column ((col ixf:ixf-column))
-  "Return a string reprensenting the PostgreSQL column definition"
-  (let* ((column-name (apply-identifier-case (ixf:ixf-column-name col)))
-         (type-definition
-          (format nil
-                  "~a~:[ not null~;~]~:[~*~; default ~a~]"
-                  (cast-ixf-type (ixf:ixf-column-type col))
-                  (ixf:ixf-column-nullable col)
-                  (ixf:ixf-column-has-default col)
-                  (ixf:ixf-column-default col))))
+(defun transform-function (field)
+  "Return the transformation functions needed to cast from ixf-column data."
+  (let ((coltype (cast-ixf-type (ixf:ixf-column-type field))))
+    ;;
+    ;; The IXF driver we use maps the data type and gets
+    ;; back proper CL typed objects, where we only want to
+    ;; deal with text.
+    ;;
+    (cond ((or (string-equal "float" coltype)
+               (string-equal "real" coltype)
+               (string-equal "double precision" coltype)
+               (and (<= 7 (length coltype))
+                    (string-equal "numeric" coltype :end2 7)))
+           #'pgloader.transforms::float-to-string)
 
-    (format nil "~a ~22t ~a" column-name type-definition)))
+          ((string-equal "text" coltype)
+           nil)
 
-(defun list-all-columns (ixf-stream table-name)
+          ((string-equal "bytea" coltype)
+           #'pgloader.transforms::byte-vector-to-bytea)
+
+          (t
+           (lambda (c)
+             (when c
+               (princ-to-string c)))))))
+
+(defmethod cast ((col ixf:ixf-column) &key &allow-other-keys)
+  "Return the PostgreSQL type definition from given IXF column definition."
+  (make-column :name (apply-identifier-case (ixf:ixf-column-name col))
+               :type-name (cast-ixf-type (ixf:ixf-column-type col))
+               :nullable (ixf:ixf-column-nullable col)
+               :default (when (ixf:ixf-column-has-default col)
+                          (format-default-value
+                           (ixf:ixf-column-default col)))
+               :transform (transform-function col)
+               :comment (let ((comment (ixf:ixf-column-desc col)))
+                          (unless (or (null comment)
+                                      (string= comment ""))
+                            comment))))
+
+(defun list-all-columns (ixf-stream table)
   "Return the list of columns for the given IXF-FILE-NAME."
-  (let ((ixf:*ixf-stream* ixf-stream))
-    (let ((ixf (ixf:read-headers)))
-      (list (cons table-name
-                  (coerce (ixf:ixf-table-columns (ixf:ixf-file-table ixf))
-                          'list))))))
+  (ixf:with-ixf-stream (ixf ixf-stream)
+    (loop :for field :across (ixf:ixf-table-columns (ixf:ixf-file-table ixf))
+       :do (add-field table field))))

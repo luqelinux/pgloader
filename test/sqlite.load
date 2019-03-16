@@ -3,7 +3,17 @@ load database
      into postgresql:///pgloader
 
  -- with include drop, create tables, create indexes, reset sequences
+ with snake_case identifiers
 
-  cast column character.f1 to text drop typemod
+  before load do
+    $$ drop schema if exists sqlite cascade; $$,
+    $$ create schema if not exists sqlite; $$
 
-  set work_mem to '16MB', maintenance_work_mem to '512 MB';
+  cast column character.f1 to text drop typemod,
+       column appointments.time to timestamptz drop default,
+       type intege to integer,
+       type character to varchar keep typemod
+
+  set work_mem to '16MB',
+      maintenance_work_mem to '512 MB',
+      search_path to 'sqlite';

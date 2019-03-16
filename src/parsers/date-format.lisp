@@ -35,25 +35,45 @@
                                    &allow-other-keys)
              (loop
                 :for (name start end) :in format
-                :when (and start end)
-                :append (list name (subseq date-string start end)))
+                :for ragged-end := (when end
+                                     (cond ((member name '(:msecs :usecs))
+                                            ;; take any number of digits up to
+                                            ;; the specified field length
+                                            ;; (less digits are allowed)
+                                            (when (<= start (length date-string))
+                                              (min end (length date-string))))
+                                           (t end)))
+                :when (and start ragged-end)
+                :append (list name (subseq date-string start ragged-end)))
            (if (or (string= year  "0000")
                    (string= month "00")
                    (string= day   "00"))
                nil
                (with-output-to-string (s)
-                 (format s "~a-~a-~a ~a:~a:~a"
-                         (let ((yint (parse-integer year)))
-                           (if (< yint *century*) (+ *century* yint) yint))
-                         month
-                         day
-                         (let ((hint (parse-integer hour)))
-                           (cond ((and am (= hint 12)) "00")
-                                 ((and pm (= hint 12)) "12")
-                                 ((and pm (< hint 12)) (+ hint 12))
-                                 (t hour)))
-                         minute
-                         seconds)
+                 ;; when given a full date format, format the date part
+                 (when (and (assoc :year format)
+                            (assoc :month format)
+                            (assoc :day format))
+                   (format s "~a-~a-~a "
+                           (let ((yint (parse-integer year)))
+                             ;; process 2-digits year formats specially
+                             (if (<= (length year) 2) (+ *century* yint) yint))
+                           month
+                           day))
+
+                 ;; now format the time part
+                 (format s "~a:~a:~a"
+                         (if hour
+                             (let ((hint (parse-integer hour)))
+                               (cond ((and am (= hint 12)) "00")
+                                     ((and pm (= hint 12)) "12")
+                                     ((and pm (< hint 12)) (+ hint 12))
+                                     (t hour)))
+                             "00")
+                         (or minute "00")
+                         (or seconds "00"))
+
+                 ;; and maybe format the micro seconds part
                  (if usecs (format s ".~a" usecs)
                      (when msecs (format s ".~a" msecs)))))))))
 
@@ -81,7 +101,7 @@
                               microseconds
                               noise)))
 
-(defrule noise (+ (or #\- #\. #\Space #\* #\# #\@ #\/ #\\ "T"))
+(defrule noise (+ (or #\: #\- #\. #\Space #\* #\# #\@ #\/ #\\ "T"))
   (:lambda (x) (incf *offset* (length (text x))) nil))
 
 (defrule year (or year4 year3 year2))

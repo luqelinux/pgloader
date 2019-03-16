@@ -2,41 +2,12 @@
 ;;; Tools to handle MySQL data type casting rules
 ;;;
 
-(in-package :pgloader.mysql)
+(in-package :pgloader.source.mysql)
 
-;;;
-;;; Some functions to deal with ENUM and SET types
-;;;
-(defun explode-mysql-enum (ctype)
-  "Convert MySQL ENUM expression into a list of labels."
-  (cl-ppcre:register-groups-bind (list)
-      ("(?i)(?:ENUM|SET)\\s*\\((.*)\\)" ctype)
-    (first (cl-csv:read-csv list :separator #\, :quote #\' :escape "\\"))))
-
-(defun get-enum-type-name (table-name column-name)
-  "Return the Type Name we're going to use in PostgreSQL."
-  (apply-identifier-case (format nil "~a_~a" table-name column-name)))
-
-(defun get-create-enum (table-name column-name ctype)
-  "Return a PostgreSQL CREATE ENUM TYPE statement from MySQL enum column."
-  (with-output-to-string (s)
-    (format s "CREATE TYPE ~a AS ENUM (~{'~a'~^, ~});"
-	    (get-enum-type-name table-name column-name)
-	    (explode-mysql-enum ctype))))
-
-(defun cast-enum (table-name column-name type ctype typemod)
-  "Cast MySQL inline ENUM type to using a PostgreSQL named type.
-
-   The type naming is hardcoded to be table-name_column-name"
+(defun enum-or-set-name (table-name column-name type ctype typemod)
   (declare (ignore type ctype typemod))
-  (get-enum-type-name table-name column-name))
-
-(defun cast-set (table-name column-name type ctype typemod)
-  "Cast MySQL inline SET type to using a PostgreSQL ENUM Array.
-
-   The ENUM data type name is hardcoded to be table-name_column-name"
-  (declare (ignore type ctype typemod))
-  (format nil "\"~a_~a\"[]" table-name column-name))
+  (apply-identifier-case
+   (format nil "~a_~a" (unquote table-name #\") (unquote column-name #\"))))
 
 ;;;
 ;;; The default MySQL Type Casting Rules
@@ -69,6 +40,21 @@
 	     :target (:type "boolean" :drop-typemod t)
 	     :using pgloader.transforms::bits-to-boolean)
 
+    ;; bigint(20) unsigned (or not, actually) does not fit into PostgreSQL
+    ;; bigint (-9223372036854775808 to +9223372036854775807):
+    (:source (:type "bigint" :typemod (< 19 precision))
+     :target (:type "numeric" :drop-typemod t))
+
+    ;; now unsigned types
+    (:source (:type "tinyint" :unsigned t)
+             :target (:type "smallint" :drop-typemod t))
+    (:source (:type "smallint" :unsigned t)
+             :target (:type "integer" :drop-typemod t))
+    (:source (:type "mediumint" :unsigned t)
+             :target (:type "integer"  :drop-typemod t))
+    (:source (:type "integer" :unsigned t)
+             :target (:type "bigint"  :drop-typemod t))
+
     ;; we need the following to benefit from :drop-typemod
     (:source (:type "tinyint")   :target (:type "smallint" :drop-typemod t))
     (:source (:type "smallint")  :target (:type "smallint" :drop-typemod t))
@@ -87,18 +73,22 @@
      :target (:type "decimal" :drop-typemod nil))
 
     ;; the text based types
-    (:source (:type "varchar")    :target (:type "text"))
-    (:source (:type "tinytext")   :target (:type "text"))
-    (:source (:type "text")       :target (:type "text"))
-    (:source (:type "mediumtext") :target (:type "text"))
-    (:source (:type "longtext")   :target (:type "text"))
+    (:source (:type "tinytext")   :target (:type "text") :using pgloader.transforms::remove-null-characters)
+    (:source (:type "text")       :target (:type "text") :using pgloader.transforms::remove-null-characters)
+    (:source (:type "mediumtext") :target (:type "text") :using pgloader.transforms::remove-null-characters)
+    (:source (:type "longtext")   :target (:type "text") :using pgloader.transforms::remove-null-characters)
+
+    (:source (:type "varchar")
+     :target (:type "varchar" :drop-typemod nil)
+     :using pgloader.transforms::remove-null-characters)
 
     (:source (:type "char")
-     :target (:type "varchar" :drop-typemod nil))
+     :target (:type "char" :drop-typemod nil)
+     :using pgloader.transforms::remove-null-characters)
 
     ;;
     ;; cl-mysql returns binary values as a simple-array of bytes (as in
-    ;; ‘(UNSIGNED-BYTE 8)), that we then need to represent as proper
+    ;; '(UNSIGNED-BYTE 8)), that we then need to represent as proper
     ;; PostgreSQL bytea input.
     ;;
     (:source (:type "binary") :target (:type "bytea")
@@ -114,11 +104,22 @@
     (:source (:type "longblob")   :target (:type "bytea")
 	     :using pgloader.transforms::byte-vector-to-bytea)
 
+    ;;
+    ;; MySQL and dates...
+    ;;
     (:source (:type "datetime" :default "0000-00-00 00:00:00" :not-null t)
      :target (:type "timestamptz" :drop-default t :drop-not-null t)
      :using pgloader.transforms::zero-dates-to-null)
 
     (:source (:type "datetime" :default "0000-00-00 00:00:00")
+     :target (:type "timestamptz" :drop-default t)
+     :using pgloader.transforms::zero-dates-to-null)
+
+    (:source (:type "datetime" :on-update-current-timestamp t :not-null t)
+     :target (:type "timestamptz" :drop-default t :drop-not-null t)
+     :using pgloader.transforms::zero-dates-to-null)
+
+    (:source (:type "datetime" :on-update-current-timestamp t :not-null nil)
      :target (:type "timestamptz" :drop-default t)
      :using pgloader.transforms::zero-dates-to-null)
 
@@ -130,29 +131,144 @@
      :target (:type "timestamptz" :drop-default t)
      :using pgloader.transforms::zero-dates-to-null)
 
+    (:source (:type "timestamp" :on-update-current-timestamp t :not-null t)
+     :target (:type "timestamptz" :drop-default t :drop-not-null t)
+     :using pgloader.transforms::zero-dates-to-null)
+
+    (:source (:type "timestamp" :on-update-current-timestamp t :not-null nil)
+     :target (:type "timestamptz" :drop-default t)
+     :using pgloader.transforms::zero-dates-to-null)
+
     (:source (:type "date" :default "0000-00-00")
      :target (:type "date" :drop-default t)
      :using pgloader.transforms::zero-dates-to-null)
 
     ;; date types without strange defaults
     (:source (:type "date")      :target (:type "date"))
-    (:source (:type "datetime")  :target (:type "timestamptz"))
-    (:source (:type "timestamp") :target (:type "timestamptz"))
     (:source (:type "year")      :target (:type "integer" :drop-typemod t))
+
+    (:source (:type "datetime")
+     :target (:type "timestamptz")
+     :using pgloader.transforms::zero-dates-to-null)
+
+    (:source (:type "timestamp")
+     :target (:type "timestamptz")
+     :using pgloader.transforms::zero-dates-to-null)
 
     ;; Inline MySQL "interesting" datatype
     (:source (:type "enum")
-     :target (:type ,#'cast-enum))
+     :target (:type ,#'enum-or-set-name))
 
     (:source (:type "set")
-     :target (:type ,#'cast-set)
+     :target (:type ,#'enum-or-set-name)
      :using pgloader.transforms::set-to-enum-array)
 
     ;; geometric data types, just POINT for now
+    (:source (:type "geometry")
+     :target (:type "point")
+     :using pgloader.transforms::convert-mysql-point)
+
     (:source (:type "point")
      :target (:type "point")
-     :using pgloader.transforms::convert-mysql-point))
+     :using pgloader.transforms::convert-mysql-point)
+
+    (:source (:type "linestring")
+     :target (:type "path")
+     :using pgloader.transforms::convert-mysql-linestring))
   "Data Type Casting rules to migrate from MySQL to PostgreSQL")
+
+
+;;;
+;;; MySQL specific fields representation and low-level
+;;;
+(defstruct (mysql-column
+	     (:constructor make-mysql-column
+			   (table-name name comment dtype ctype default nullable extra)))
+  table-name name dtype ctype default nullable extra comment)
+
+(defmethod field-name ((field mysql-column) &key)
+  (mysql-column-name field))
+
+(defun explode-mysql-enum (ctype)
+  "Convert MySQL ENUM expression into a list of labels."
+  (cl-ppcre:register-groups-bind (list)
+      ("(?i)(?:ENUM|SET)\\s*\\((.*)\\)" ctype)
+    (first (cl-csv:read-csv list :separator #\, :quote #\' :escape "''"))))
+
+(defun normalize-extra (extra)
+  "Normalize MySQL strings into pgloader CL keywords for internal processing."
+  (cond ((string= "auto_increment" extra)
+         :auto-increment)
+
+        ((or (string= extra "on update CURRENT_TIMESTAMP")
+             (string= extra "on update current_timestamp()"))
+         :on-update-current-timestamp)))
+
+(defmethod cast ((col mysql-column) &key table)
+  "Return the PostgreSQL type definition from given MySQL column definition."
+  (with-slots (table-name name dtype ctype default nullable extra comment)
+      col
+    (let* ((pgcol
+            (apply-casting-rules table-name name dtype ctype default nullable extra)))
+      (setf (column-comment pgcol) comment)
+
+      ;; normalize default values that are left after applying user defined
+      ;; casting rules "drop default" and "keep default"
+      (let ((default (column-default pgcol)))
+        (setf (column-default pgcol)
+              (cond
+                ((and (stringp default) (string= "NULL" default))
+                 :null)
+
+                ((and (stringp default)
+                      ;; address CURRENT_TIMESTAMP(6) and other spellings
+                      (or (uiop:string-prefix-p "CURRENT_TIMESTAMP" default)
+                          (string= "CURRENT TIMESTAMP" default)
+                          (string= "current_timestamp()" default)))
+                 :current-timestamp)
+
+                (t (column-default pgcol)))))
+
+      ;; extra user-defined data types
+      (when (or (string-equal "set" dtype)
+                (string-equal "enum" dtype))
+        ;;
+        ;; SET and ENUM both need more care, if the target is PostgreSQL we
+        ;; need to create per-schema user defined data types that match the
+        ;; column local definition here.
+        ;;
+        (let ((sqltype-name (enum-or-set-name table-name
+                                              (column-name pgcol)
+                                              dtype
+                                              ctype
+                                              nil)))
+          ;;
+          ;; We might have user-defined cast rules e.g. converting an ENUM
+          ;; to text, in which case we have nothing to do here. We set a
+          ;; PostgreSQL enum only when the casting rules already generated
+          ;; the target type name.
+          ;;
+          ;; FIXME: why call enum-or-set-name twice, once from
+          ;; *mysql-default-cast-rules* and once here explicitely?
+          ;;
+          (when (string= sqltype-name (column-type-name pgcol))
+            (setf (column-type-name pgcol)
+                  (make-sqltype :name sqltype-name
+                                :schema (table-schema table)
+                                :type (intern (string-upcase dtype)
+                                              (find-package "KEYWORD"))
+                                :source-def ctype
+                                :extra (explode-mysql-enum ctype))))))
+
+      ;; extra triggers
+      ;;
+      ;; See src/pgsql/pgsql-trigger.lisp
+      ;;
+      (when (eq (column-extra pgcol) :on-update-current-timestamp)
+        (setf (column-extra pgcol)
+              (make-trigger :name :on-update-current-timestamp)))
+
+      pgcol)))
 
 
 ;;;
@@ -163,7 +279,7 @@
 (defun test-casts ()
   "Just test some cases for the casts"
   (let ((*cast-rules*
-	 '(;; (:source (:column "col1" :auto-increment nil)
+	 '( ;; (:source (:column "col1" :auto-increment nil)
 	   ;;  :target (:type "timestamptz"
 	   ;; 	     :drop-default nil
 	   ;; 	     :drop-not-null nil)
@@ -173,7 +289,7 @@
 	    :target (:type "text" :drop-default nil :drop-not-null nil)
 	    :using nil)
 
-	   (:source (:type "char" :typemod (= (car typemod) 1))
+	   (:source (:type "char" :typemod (= precision 1))
 	    :target (:type "char" :drop-typemod nil))
 
            (:source (:column ("table" . "g"))
@@ -214,10 +330,10 @@
     (format t "   ~a~30T~a~65T~a~%" "MySQL ctype" "PostgreSQL type" "transform")
     (format t "   ~a~30T~a~65T~a~%" "-----------" "---------------" "---------")
     (loop
-       for (name dtype ctype nullable default extra) in columns
-       for mycol = (make-mysql-column "table" name dtype ctype nullable default extra)
-       for (pgtype fn) = (multiple-value-bind (pgcol fn)
-                             (cast "table" name dtype ctype nullable default extra)
-                           (list pgcol fn))
-       do
-	 (format t "~a: ~a~30T~a~65T~:[~;using ~a~]~%" name ctype pgtype fn fn))))
+       :for (name dtype ctype nullable default extra) :in columns
+       :for mycol := (make-mysql-column "table" name nil dtype ctype nullable default extra)
+       :for pgcol := (cast mycol)
+       :do (format t "~a: ~a~30T~a~65T~:[~;using ~a~]~%" name ctype
+                   (format-column pgcol)
+                   (pgloader.pgsql::column-transform pgcol)
+                   (pgloader.pgsql::column-transform pgcol)))))

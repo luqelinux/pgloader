@@ -14,3 +14,6 @@ web/howto/mysql.html
 web/howto/pgloader.1.html
 web/howto/quickstart.html
 web/howto/sqlite.html
+.DS_Store
+system-index.txt
+docs/_build

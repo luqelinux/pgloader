@@ -24,13 +24,13 @@
 (defrule keep-a-single-whitespace (+ (or #\space #\tab #\newline #\linefeed))
   (:constant " "))
 
-(defrule whitespace (+ (or #\space #\tab #\newline #\linefeed comments))
+(defrule whitespace (+ (or #\space #\tab #\return #\newline #\linefeed comments))
   (:constant 'whitespace))
 
 (defrule ignore-whitespace (* whitespace)
   (:constant nil))
 
-(defrule punct (or #\, #\- #\_)
+(defrule punct (or #\- #\_ #\$ #\%)
   (:text t))
 
 (defrule namestring (and (or #\_ (alpha-char-p character))
@@ -39,11 +39,11 @@
 				punct)))
   (:text t))
 
-(defrule double-quoted-namestring (and #\" namestring #\")
-  (:destructure (open name close) (declare (ignore open close)) name))
+(defrule double-quoted-namestring (and #\" (* (not #\")) #\")
+  (:lambda (dqn) (text (second dqn))))
 
-(defrule quoted-namestring (and #\' namestring #\')
-  (:destructure (open name close) (declare (ignore open close)) name))
+(defrule quoted-namestring (and #\' (+ (not #\')) #\')
+  (:lambda (dqn) (text (second dqn))))
 
 (defrule name (or namestring quoted-namestring)
   (:text t))
@@ -51,3 +51,17 @@
 (defrule trimmed-name (and ignore-whitespace name)
   (:destructure (whitespace name) (declare (ignore whitespace)) name))
 
+(defrule namestring-or-regex (or quoted-namestring quoted-regex))
+
+(defrule maybe-quoted-namestring (or double-quoted-namestring
+                                     quoted-namestring
+                                     namestring))
+
+(defrule open-paren (and ignore-whitespace #\( ignore-whitespace)
+  (:constant :open-paren))
+
+(defrule close-paren (and ignore-whitespace #\) ignore-whitespace)
+  (:constant :close-paren))
+
+(defrule comma-separator (and ignore-whitespace #\, ignore-whitespace)
+  (:constant ","))

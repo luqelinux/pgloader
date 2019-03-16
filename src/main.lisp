@@ -1,5 +1,8 @@
 (in-package #:pgloader)
 
+;;;
+;;; Now some tooling
+;;;
 (defun log-threshold (min-message &key quiet verbose debug)
   "Return the internal value to use given the script parameters."
   (cond ((and debug verbose) :data)
@@ -42,6 +45,18 @@
     (("load-lisp-file" #\l) :type string :list t :optional t
      :documentation "Read user code from files")
 
+    ("dry-run" :type boolean
+               :documentation "Only check database connections, don't load anything.")
+
+    ("on-error-stop" :type boolean
+                     :documentation "Refrain from handling errors properly.")
+
+    ("no-ssl-cert-verification"
+     :type boolean
+     :documentation "Instruct OpenSSL to bypass verifying certificates.")
+
+    (("context" #\C) :type string :documentation "Command Context Variables")
+
     (("with") :type string :list t :optional t
      :documentation "Load options")
 
@@ -67,14 +82,17 @@
      :documentation "SQL script to run after loading the data")
 
     ("self-upgrade" :type string :optional t
-     :documentation "Path to pgloader newer sources")))
+                    :documentation "Path to pgloader newer sources")
 
-(defun print-backtrace (condition debug stream)
+    ("regress" :type boolean :optional t
+               :documentation "Drive regression testing")))
+
+(defun print-backtrace (condition debug)
   "Depending on DEBUG, print out the full backtrace or just a shorter
    message on STREAM for given CONDITION."
   (if debug
-      (trivial-backtrace:print-backtrace condition :output stream :verbose t)
-      (trivial-backtrace:print-condition condition stream)))
+      (trivial-backtrace:print-backtrace condition :output nil)
+      (trivial-backtrace:print-condition condition nil)))
 
 (defun mkdir-or-die (path debug &optional (stream *standard-output*))
   "Create a directory at given PATH and exit with an error message when
@@ -87,7 +105,7 @@
     (condition (e)
       ;; any error here is a panic
       (if debug
-	  (print-backtrace e debug stream)
+	  (format stream "PANIC: ~a~%" (print-backtrace e debug))
 	  (format stream "PANIC: ~a.~%" e))
       (uiop:quit))))
 
@@ -110,7 +128,7 @@
   (format t "~&~a [ option ... ] command-file ..." (first argv))
   (format t "~&~a [ option ... ] SOURCE TARGET" (first argv))
   (command-line-arguments:show-option-help *opt-spec*)
-  (when quit (uiop:quit)))
+  (when quit (uiop:quit +os-code-error-usage+)))
 
 (defvar *self-upgraded-already* nil
   "Keep track if we did reload our own source code already.")
@@ -121,7 +139,7 @@
                             (uiop:parse-unix-namestring namestring))))
     (unless pgloader-pathname
       (format t "No such directory: ~s~%" namestring)
-      (uiop:quit))
+      (uiop:quit +os-code-error+))
 
     ;; now the real thing
     (handler-case
@@ -153,7 +171,7 @@
 (defvar *--load-list-file-extension-whitelist* '("lisp" "lsp" "cl" "asd")
   "White list of file extensions allowed with the --load option.")
 
-(defun load-extra-transformation-functions (filename)
+(defun load-extra-transformation-functions (filename &optional verbose)
   "Load an extra filename to tweak pgloader's behavior."
   (let ((pathname (uiop:parse-native-namestring filename)))
     (unless (member (pathname-type pathname)
@@ -161,7 +179,8 @@
                     :test #'string=)
       (error "Unknown lisp file extension: ~s" (pathname-type pathname)))
 
-    (load (compile-file pathname :verbose nil :print nil))))
+    (format t "Loading code from ~s~%" pathname)
+    (load (compile-file pathname :verbose verbose :print verbose))))
 
 (defun main (argv)
   "Entry point when building an executable image with buildapp"
@@ -177,10 +196,13 @@
 
       (destructuring-bind (&key help version quiet verbose debug logfile
 				list-encodings upgrade-config
+                                dry-run on-error-stop context
                                 ((:load-lisp-file load))
 				client-min-messages log-min-messages summary
 				root-dir self-upgrade
-                                with set field cast type encoding before after)
+                                with set field cast type encoding before after
+                                no-ssl-cert-verification
+                                regress)
 	  options
 
         ;; parse the log thresholds
@@ -203,6 +225,11 @@
             (let ((*self-upgraded-already* t))
               (main argv))))
 
+        ;; --list-encodings, -E
+	(when list-encodings
+	  (show-encodings)
+	  (uiop:quit +os-code-success+))
+
 	;; First care about the root directory where pgloader is supposed to
 	;; output its data logs and reject files
         (let ((root-dir-truename (or (probe-file root-dir)
@@ -212,8 +239,20 @@
 	;; Set parameters that come from the environement
 	(init-params-from-environment)
 
+        ;; Read the context file (if given) and the environment
+        (handler-case
+            (initialize-context context)
+          (condition (e)
+            (format t "Couldn't read ini file ~s: ~a~%" context e)
+            (usage argv)))
+
 	;; Then process options
 	(when debug
+          (format t "pgloader version ~a~%" *version-string*)
+          #+pgloader-image
+          (format t "compiled with ~a ~a~%"
+                  (lisp-implementation-type)
+                  (lisp-implementation-version))
 	  #+sbcl
           (format t "sb-impl::*default-external-format* ~s~%"
 		  sb-impl::*default-external-format*)
@@ -225,14 +264,14 @@
                   (lisp-implementation-type)
                   (lisp-implementation-version)))
 
-	(when help
+	(when (or help)
           (usage argv))
 
-	(when (or help version) (uiop:quit))
+	(when (or help version) (uiop:quit +os-code-success+))
 
-	(when list-encodings
-	  (show-encodings)
-	  (uiop:quit))
+        (when (null arguments)
+          (usage argv)
+          (uiop:quit +os-code-error-usage+))
 
 	(when upgrade-config
 	  (loop for filename in arguments
@@ -242,20 +281,25 @@
                      (pgloader.ini:convert-ini-into-commands filename))
                  (condition (c)
                    (when debug (invoke-debugger c))
-                   (uiop:quit 1)))
-	       (format t "~%~%"))
-	  (uiop:quit))
+                   (uiop:quit +os-code-error+))))
+	  (uiop:quit +os-code-success+))
 
-	(when load
-          (loop for filename in load do
-               (handler-case
-                   (load-extra-transformation-functions filename)
-                 (condition (e)
-                   (format *standard-output*
-                           "Failed to load lisp source file ~s~%"
-                           filename)
-                   (format *standard-output* "~a~%" e)
-                   (uiop:quit 3)))))
+        ;; Should we run in dry-run mode?
+        (setf *dry-run* dry-run)
+
+        ;; Should we stop at first error?
+        (setf *on-error-stop* on-error-stop)
+
+        ;; load extra lisp code provided for by the user
+        (when load
+          (loop :for filename :in load :do
+             (handler-case
+                 (load-extra-transformation-functions filename debug)
+               ((or simple-condition serious-condition) (e)
+                 (format *error-output*
+                         "Failed to load lisp source file ~s~%" filename)
+                 (format *error-output* "~a~%~%" e)
+                 (uiop:quit +os-code-error+)))))
 
 	;; Now process the arguments
 	(when arguments
@@ -263,237 +307,88 @@
 	  (let* ((*log-filename*      (log-file-name logfile))
                  (*summary-pathname*  (parse-summary-filename summary debug)))
 
-            (with-monitor ()
-              ;; tell the user where to look for interesting things
-              (log-message :log "Main logs in '~a'" (probe-file *log-filename*))
-              (log-message :log "Data errors in '~a'~%" *root-dir*)
+            (handler-case
+                ;; The handler-case is to catch unhandled exceptions at the
+                ;; top level.
+                ;;
+                ;; The handler-bind below is to be able to offer a
+                ;; meaningful backtrace to the user in case of unexpected
+                ;; conditions being signaled.
+                (handler-bind
+                    (((and condition (not (or monitor-error
+                                              cli-parsing-error
+                                              source-definition-error
+                                              regression-test-error)))
+                      #'(lambda (condition)
+                          (format *error-output* "KABOOM!~%")
+                          (format *error-output* "FATAL error: ~a~%~a~%~%"
+                                  condition
+                                  (print-backtrace condition debug)))))
 
-              (handler-case
-                  ;; The handler-case is to catch unhandled exceptions at the
-                  ;; top level.
-                  ;;
-                  ;; The handler-bind is to be able to offer a meaningful
-                  ;; backtrace to the user in case of unexpected conditions
-                  ;; being signaled.
-                  (handler-bind
-                      ((condition
-                        #'(lambda (condition)
-                            (log-message :fatal "We have a situation here.")
-                            (print-backtrace condition debug *standard-output*))))
+                  (with-monitor ()
+                    ;; tell the user where to look for interesting things
+                    (log-message :log "Main logs in '~a'"
+                                 (uiop:native-namestring *log-filename*))
+                    (log-message :log "Data errors in '~a'~%" *root-dir*)
 
-                    ;; if there are exactly two arguments in the command
-                    ;; line, try and process them as source and target
-                    ;; arguments
-                    (if (= 2 (length arguments))
-                        (let* ((type   (parse-cli-type type))
-                               (source (first arguments))
-                               (source (if type
-                                           (parse-source-string-for-type type source)
-                                           (parse-source-string source)))
-                               (type   (parse-cli-type (conn-type source)))
-                               (target (parse-target-string (second arguments))))
+                    (when no-ssl-cert-verification
+                      (setf cl+ssl:*make-ssl-client-stream-verify-default* nil))
 
-                          ;; some verbosity about the parsing "magic"
-                          (log-message :info "SOURCE: ~s" source)
-                          (log-message :info "TARGET: ~s" target)
+                    (cond
+                      ((and regress (= 1 (length arguments)))
+                       (process-regression-test (first arguments)))
 
-                          (cond ((and (null source) (null target)
-                                      (probe-file
-                                       (uiop:parse-unix-namestring
-                                        (first arguments)))
-                                      (probe-file
-                                       (uiop:parse-unix-namestring
-                                        (second arguments))))
-                                 (mapcar #'process-command-file arguments))
+                      (regress
+                       (log-message :fatal "Regression testing requires a single .load file as input."))
 
-                                ((null source)
-                                 (log-message :fatal
-                                              "Failed to parse ~s as a source URI."
-                                              (first arguments))
-                                 (log-message :log "You might need to use --type."))
+                      ((= 2 (length arguments))
+                       ;; if there are exactly two arguments in the command
+                       ;; line, try and process them as source and target
+                       ;; arguments
+                       (process-source-and-target (first arguments)
+                                                  (second arguments)
+                                                  type encoding
+                                                  set with field cast
+                                                  before after))
+                      (t
+                       ;; process the files
+                       ;; other options are not going to be used here
+                       (let ((cli-options `(("--type"     ,type)
+                                            ("--encoding" ,encoding)
+                                            ("--set"      ,set)
+                                            ("--with"     ,with)
+                                            ("--field"    ,field)
+                                            ("--cast"     ,cast)
+                                            ("--before"   ,before)
+                                            ("--after"    ,after))))
+                         (loop :for (cli-option-name cli-option-value)
+                            :in cli-options
+                            :when cli-option-value
+                            :do (log-message
+                                 :fatal
+                                 "Option ~s is ignored when using a load file"
+                                 cli-option-name))
 
-                                ((null target)
-                                 (log-message :fatal
-                                              "Failed to parse ~s as a PostgreSQL database URI."
-                                              (second arguments))))
+                         ;; when we issued a single error previously, do nothing
+                         (unless (remove-if #'null (mapcar #'second cli-options))
+                           (process-command-file arguments)))))))
 
-                          ;; so, we actually have all the specs for the
-                          ;; job on the command line now.
-                          (when (and source target)
-                            (load-data :from source
-                                       :into target
-                                       :encoding (parse-cli-encoding encoding)
-                                       :options  (parse-cli-options type with)
-                                       :gucs     (parse-cli-gucs set)
-                                       :fields   (parse-cli-fields type field)
-                                       :casts    (parse-cli-casts cast)
-                                       :before   (parse-sql-file before)
-                                       :after    (parse-sql-file after)
-                                       :start-logger nil)))
+              ((or cli-parsing-error source-definition-error) (c)
+                (format *error-output* "~%~a~%~%" c)
+                (uiop:quit +os-code-error-bad-source+))
 
-                        ;; process the files
-                        (mapcar #'process-command-file arguments)))
+              (regression-test-error (c)
+                (format *error-output* "~%~a~%~%" c)
+                (uiop:quit +os-code-error-regress+))
 
-                (source-definition-error (c)
-                  (log-message :fatal "~a" c)
-                  (uiop:quit 2))
+              (monitor-error (c)
+                (format *error-output* "~a~%" c)
+                (uiop:quit +os-code-error+))
 
-                (condition (c)
-                  (when debug (invoke-debugger c))
-                  (uiop:quit 1))))))
+              (condition (c)
+                (format *error-output* "~%What I am doing here?~%~%")
+                (format *error-output* "~a~%~%" c)
+                (uiop:quit +os-code-error+)))))
 
         ;; done.
-	(uiop:quit)))))
-
-(defun process-command-file (filename)
-  "Process FILENAME as a pgloader command file (.load)."
-  (let ((truename (probe-file filename)))
-    (if truename
-        (run-commands truename :start-logger nil)
-        (log-message :error "Can not find file: ~s" filename)))
-  (format t "~&"))
-
-(defun run-commands (source
-		     &key
-		       (start-logger t)
-                       ((:summary *summary-pathname*) *summary-pathname*)
-		       ((:log-filename *log-filename*) *log-filename*)
-		       ((:log-min-messages *log-min-messages*) *log-min-messages*)
-		       ((:client-min-messages *client-min-messages*) *client-min-messages*))
-  "SOURCE can be a function, which is run, a list, which is compiled as CL
-   code then run, a pathname containing one or more commands that are parsed
-   then run, or a commands string that is then parsed and each command run."
-
-  (with-monitor (:start-logger start-logger)
-    (let* ((funcs
-            (typecase source
-              (function (list source))
-
-              (list     (list (compile nil source)))
-
-              (pathname (mapcar (lambda (expr) (compile nil expr))
-                                (parse-commands-from-file source)))
-
-              (t        (mapcar (lambda (expr) (compile nil expr))
-                                (if (probe-file source)
-                                    (parse-commands-from-file source)
-                                    (parse-commands source)))))))
-
-      ;; maybe duplicate the summary to a file
-      (let* ((summary-stream (when *summary-pathname*
-                               (open *summary-pathname*
-                                     :direction :output
-                                     :if-exists :rename
-                                     :if-does-not-exist :create)))
-             (*report-stream* (or summary-stream *standard-output*)))
-        (unwind-protect
-             ;; run the commands
-             (loop for func in funcs do (funcall func))
-
-          ;; cleanup
-          (when summary-stream (close summary-stream)))))))
-
-
-;;;
-;;; Main API to use from outside of pgloader.
-;;;
-(define-condition source-definition-error (error)
-  ((mesg :initarg :mesg :reader source-definition-error-mesg))
-  (:report (lambda (err stream)
-             (format stream "~a" (source-definition-error-mesg err)))))
-
-(defun load-data (&key ((:from source)) ((:into target))
-                    encoding fields options gucs casts before after
-                    (start-logger t))
-  "Load data from SOURCE into TARGET."
-  (declare (type connection source)
-           (type pgsql-connection target))
-
-  ;; some preliminary checks
-  (when (and (typep source 'csv-connection)
-             (not (typep source 'copy-connection))
-             (null fields))
-    (error 'source-definition-error
-           :mesg "This data source requires fields definitions."))
-
-  (when (and (typep source 'csv-connection) (null (pgconn-table-name target)))
-    (error 'source-definition-error
-           :mesg "This data source require a table name target."))
-
-  (when (and (typep source 'fixed-connection) (null (pgconn-table-name target)))
-    (error 'source-definition-error
-           :mesg "Fixed-width data source require a table name target."))
-
-  (with-monitor (:start-logger start-logger)
-    (when (and casts (not (member (type-of source)
-                                  '(sqlite-connection
-                                    mysql-connection
-                                    mssql-connection))))
-      (log-message :log "Cast rules are ignored for this sources."))
-
-    ;; now generates the code for the command
-    (log-message :debug "LOAD DATA FROM ~s" source)
-    (run-commands
-     (process-relative-pathnames
-      (uiop:getcwd)
-      (typecase source
-        (copy-connection
-         (lisp-code-for-loading-from-copy source fields target
-                                          :encoding (or encoding :default)
-                                          :gucs gucs
-                                          :copy-options options
-                                          :before before
-                                          :after after))
-
-        (fixed-connection
-         (lisp-code-for-loading-from-fixed source fields target
-                                           :encoding encoding
-                                           :gucs gucs
-                                           :fixed-options options
-                                           :before before
-                                           :after after))
-
-        (csv-connection
-         (lisp-code-for-loading-from-csv source fields target
-                                         :encoding encoding
-                                         :gucs gucs
-                                         :csv-options options
-                                         :before before
-                                         :after after))
-
-        (dbf-connection
-         (lisp-code-for-loading-from-dbf source target
-                                         :gucs gucs
-                                         :dbf-options options
-                                         :before before
-                                         :after after))
-
-        (ixf-connection
-         (lisp-code-for-loading-from-ixf source target
-                                         :gucs gucs
-                                         :ixf-options options
-                                         :before before
-                                         :after after))
-
-        (sqlite-connection
-         (lisp-code-for-loading-from-sqlite source target
-                                            :gucs gucs
-                                            :casts casts
-                                            :sqlite-options options))
-
-        (mysql-connection
-         (lisp-code-for-loading-from-mysql source target
-                                           :gucs gucs
-                                           :casts casts
-                                           :mysql-options options
-                                           :before before
-                                           :after after))
-
-        (mssql-connection
-         (lisp-code-for-loading-from-mssql source target
-                                           :gucs gucs
-                                           :casts casts
-                                           :mssql-options options
-                                           :before before
-                                           :after after))))
-     :start-logger start-logger)))
+	(uiop:quit +os-code-success+)))))

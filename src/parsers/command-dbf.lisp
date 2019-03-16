@@ -18,9 +18,13 @@
     (bind (((_ _ _ table-name) tn))
       (cons :table-name (text table-name)))))
 
-(defrule dbf-option (or option-batch-rows
+(defrule dbf-option (or option-on-error-stop
+                        option-on-error-resume-next
+                        option-workers
+                        option-concurrency
+                        option-batch-rows
                         option-batch-size
-                        option-batch-concurrency
+                        option-prefetch-rows
                         option-truncate
                         option-disable-triggers
                         option-data-only
@@ -28,21 +32,11 @@
                         option-include-drop
                         option-create-table
                         option-create-tables
-                        option-table-name))
+                        option-table-name
+                        option-identifiers-case))
 
-(defrule another-dbf-option (and comma dbf-option)
-  (:lambda (source)
-    (bind (((_ option) source)) option)))
-
-(defrule dbf-option-list (and dbf-option (* another-dbf-option))
-  (:lambda (source)
-    (destructuring-bind (opt1 opts) source
-      (alexandria:alist-plist `(,opt1 ,@opts)))))
-
-(defrule dbf-options (and kw-with dbf-option-list)
-  (:lambda (source)
-    (bind (((_ opts) source))
-      (cons :dbf-options opts))))
+(defrule dbf-options (and kw-with (and dbf-option (* (and comma dbf-option))))
+  (:function flatten-option-list))
 
 (defrule dbf-uri (and "dbf://" filename)
   (:lambda (source)
@@ -75,57 +69,69 @@
         (bind (((_ _ encoding) enc)) encoding)
 	:ascii)))
 
-(defrule load-dbf-command (and dbf-source (? dbf-file-encoding)
-                               target load-dbf-optional-clauses)
+(defrule load-dbf-command (and dbf-source
+                               (? dbf-file-encoding)
+                               target
+                               (? csv-target-table)
+                               load-dbf-optional-clauses)
   (:lambda (command)
-    (destructuring-bind (source encoding target clauses) command
-      `(,source ,encoding ,target ,@clauses))))
+    (destructuring-bind (source encoding pguri table-name clauses)
+        command
+      (list* source
+             encoding
+             pguri
+             (or table-name (pgconn-table-name pguri))
+             clauses))))
+
+(defun lisp-code-for-dbf-dry-run (dbf-db-conn pg-db-conn)
+  `(lambda ()
+     (let ((source-db (expand (fetch-file ,dbf-db-conn))))
+       (check-connection source-db)
+       (check-connection ,pg-db-conn))))
 
 (defun lisp-code-for-loading-from-dbf (dbf-db-conn pg-db-conn
                                        &key
+                                         target-table-name
                                          (encoding :ascii)
-                                         gucs before after
-                                         ((:dbf-options options)))
+                                         gucs before after options
+                                         &allow-other-keys)
   `(lambda ()
-     (let* ((state-before   (pgloader.utils:make-pgstate))
-            (summary        (null *state*))
-            (*state*        (or *state* (pgloader.utils:make-pgstate)))
-            (state-after   ,(when after `(pgloader.utils:make-pgstate)))
-            ,@(pgsql-connection-bindings pg-db-conn gucs)
+     (let* (,@(pgsql-connection-bindings pg-db-conn gucs)
             ,@(batch-control-bindings options)
-            ,@(identifier-case-binding options)
-            (table-name    ,(or (getf options :table-name)
-                                (pgconn-table-name pg-db-conn)))
-            (source-db     (with-stats-collection ("fetch" :state state-before)
-                             (expand (fetch-file ,dbf-db-conn))))
-            (source
-             (make-instance 'pgloader.db3:copy-db3
-                            :target-db ,pg-db-conn
-                            :encoding ,encoding
-                            :source-db source-db
-                            :target table-name)))
+              ,@(identifier-case-binding options)
+              (on-error-stop (getf ',options :on-error-stop))
+              (source-db     (with-stats-collection ("fetch" :section :pre)
+                               (expand (fetch-file ,dbf-db-conn))))
+              (source
+               (make-instance 'copy-db3
+                              :target-db ,pg-db-conn
+                              :encoding ,encoding
+                              :source-db source-db
+                              :target ,(when target-table-name
+                                         (create-table target-table-name)))))
 
-       ,(sql-code-block pg-db-conn 'state-before before "before load")
+       ,(sql-code-block pg-db-conn :pre before "before load")
 
-       (pgloader.sources:copy-database source
-                                       :state-before state-before
-                                       ,@(remove-batch-control-option options))
+       (copy-database source
+                      ,@(remove-batch-control-option options)
+                      :on-error-stop on-error-stop
+                      :create-indexes nil
+                      :foreign-keys nil
+                      :reset-sequences nil)
 
-       ,(sql-code-block pg-db-conn 'state-after after "after load")
-
-       ;; reporting
-       (when summary
-         (report-full-summary "Total import time" *state*
-                              :before state-before
-                              :finally state-after)))))
+       ,(sql-code-block pg-db-conn :post after "after load"))))
 
 (defrule load-dbf-file load-dbf-command
   (:lambda (command)
-    (bind (((source encoding pg-db-uri
-                    &key ((:dbf-options options)) gucs before after) command))
-      (lisp-code-for-loading-from-dbf source pg-db-uri
-                                      :encoding encoding
-                                      :gucs gucs
-                                      :before before
-                                      :after after
-                                      :dbf-options options))))
+    (bind (((source encoding pg-db-uri table-name
+                    &key options gucs before after) command))
+      (cond (*dry-run*
+             (lisp-code-for-dbf-dry-run source pg-db-uri))
+            (t
+             (lisp-code-for-loading-from-dbf source pg-db-uri
+                                             :target-table-name table-name
+                                             :encoding encoding
+                                             :gucs gucs
+                                             :before before
+                                             :after after
+                                             :options options))))))

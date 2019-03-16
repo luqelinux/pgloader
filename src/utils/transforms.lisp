@@ -7,6 +7,75 @@
 
 (in-package :pgloader.transforms)
 
+;;;
+;;; This package is used to generate symbols in the CL code that
+;;; project-fields produces, allowing to use symbols such as t. It's
+;;; important that the user-symbols package doesn't :use cl.
+;;;
+(defpackage #:pgloader.user-symbols (:use))
+
+(defun intern-symbol (symbol-name &optional (overrides '()))
+  "Return a symbol in either PGLOADER.TRANSFORMS if it exists there
+   already (it's a user provided function) or a PGLOADER.USER-SYMBOLS
+   package.
+
+   OVERRIDES is an alist of symbol . value, allowing called to force certain
+   values: the classic example is how to parse the \"nil\" symbol-name.
+   Given OVERRIDES as '((nil . nil)) the returned symbol will be cl:nil
+   rather than pgloader.user-symbols::nil."
+  (let ((overriden (assoc symbol-name overrides :test #'string-equal)))
+    (if overriden
+        (cdr overriden)
+
+        (multiple-value-bind (symbol status)
+            (find-symbol (string-upcase symbol-name)
+                         (find-package "PGLOADER.TRANSFORMS"))
+          ;; pgloader.transforms package (:use :cl) so we might find variable
+          ;; names in there that we want to actually intern in
+          ;; pgloader.user-symbols so that users may use e.g. t as a column name...
+          ;; so only use transform symbol when it denotes a function
+          (cond
+            ((and status (fboundp symbol)) symbol) ; a transform function
+
+            (t
+             (intern (string-upcase symbol-name)
+                     (find-package "PGLOADER.USER-SYMBOLS"))))))))
+
+;;;
+;;; Handling typmod in the general case, don't apply to ENUM types
+;;;
+(defun parse-column-typemod (data-type column-type)
+  "Given int(7), returns the number 7.
+
+   Beware that some data-type are using a typmod looking definition for
+   things that are not typmods at all: enum."
+  (unless (or (string= "enum" data-type)
+	      (string= "set" data-type))
+    (let ((start-1 (position #\( column-type))	; just before start position
+	  (end     (position #\) column-type)))	; just before end position
+      (when (and start-1 (< (+ 1 start-1) end))
+	(destructuring-bind (a &optional b)
+	    (mapcar #'parse-integer
+		    (sq:split-sequence #\, column-type
+				       :start (+ 1 start-1) :end end))
+	  (list a b))))))
+
+(defun typemod-expr-matches-p (rule-typemod-expr typemod)
+  "Check if an expression such as (< 10) matches given typemod."
+  (funcall (compile nil (typemod-expr-to-function rule-typemod-expr)) typemod))
+
+(defun typemod-expr-to-function (expr)
+  "Transform given EXPR into a callable function object."
+  `(lambda (typemod)
+     (destructuring-bind (precision &optional (scale 0))
+         typemod
+       (declare (ignorable precision scale))
+       ,expr)))
+
+
+;;;
+;;; Some optimisation stanza
+;;;
 (declaim (inline intern-symbol
 		 zero-dates-to-null
 		 date-with-no-separator
@@ -16,22 +85,18 @@
 		 int-to-ip
 		 ip-range
 		 convert-mysql-point
-		 float-to-string
+		 integer-to-string
+                 float-to-string
                  empty-string-to-null
 		 set-to-enum-array
 		 right-trim
 		 byte-vector-to-bytea
                  sqlite-timestamp-to-timestamp
                  sql-server-uniqueidentifier-to-uuid
-                 sql-server-bit-to-boolean))
-
-
-;;;
-;;; Some tools for reading expressions in the parser, and evaluating them.
-;;;
-(defun intern-symbol (symbol-name)
-  (intern (string-upcase symbol-name)
-	  (find-package "PGLOADER.TRANSFORMS")))
+                 sql-server-bit-to-boolean
+                 varbinary-to-string
+                 base64-decode
+		 hex-to-dec))
 
 
 ;;;
@@ -61,21 +126,23 @@
   "Apply this function when input date in like '20041002152952'"
   ;; only process non-zero dates
   (declare (type (or null string) date-string))
-  (cond ((null date-string)                nil)
-        ((string= date-string "")          nil)
-        ((not (= 14 (length date-string))) nil)
-        (t
-         (destructuring-bind (&key year month day hour minute seconds
-                                   &allow-other-keys)
-             (loop
-                for (name start end) in format
-                append (list name (subseq date-string start end)))
-           (if (or (string= year  "0000")
-                   (string= month "00")
-                   (string= day   "00"))
-               nil
-               (format nil "~a-~a-~a ~a:~a:~a"
-                       year month day hour minute seconds))))))
+  (let ((str-length      (length date-string))
+        (expected-length (reduce #'max (mapcar #'third format))))
+    (cond ((null date-string)                   nil)
+          ((string= date-string "")             nil)
+          ((not (= expected-length str-length)) nil)
+          (t
+           (destructuring-bind (&key year month day hour minute seconds
+                                     &allow-other-keys)
+               (loop
+                  for (name start end) in format
+                  append (list name (subseq date-string start end)))
+             (if (or (string= year  "0000")
+                     (string= month "00")
+                     (string= day   "00"))
+                 nil
+                 (format nil "~a-~a-~a ~a:~a:~a"
+                         year month day hour minute seconds)))))))
 
 (defun time-with-no-separator
     (time-string
@@ -104,7 +171,13 @@
   "When using MySQL, strange things will happen, like encoding booleans into
    bit(1). Of course PostgreSQL wants 'f' and 't'."
   (when (and bit-vector (= 1 (length bit-vector)))
-    (if (= 0 (aref bit-vector 0)) "f" "t")))
+    (let ((bit (aref bit-vector 0)))
+      ;; we might have either a char or a number here, see issue #684.
+      ;; current guess when writing the code is that it depends on MySQL
+      ;; version, but this has not been checked.
+      (etypecase bit
+        (fixnum    (if (= 0 bit) "f" "t"))
+        (character (if (= 0 (char-code bit)) "f" "t"))))))
 
 (defun int-to-ip (int)
   "Transform an IP as integer into its dotted notation, optimised code from
@@ -147,14 +220,49 @@
       (setf (aref point (position #\Space point)) #\,)
       point)))
 
+(defun convert-mysql-linestring (mysql-linestring-as-string)
+  "Transform the MYSQL-POINT-AS-STRING into a suitable representation for
+   PostgreSQL.
+
+  Input:   \"LINESTRING(-87.87342467651445 45.79684462673078,-87.87170806274479 45.802110434248966)\" ; that's using astext(column)
+  Output:  [(-87.87342467651445,45.79684462673078),(-87.87170806274479,45.802110434248966)]"
+  (when mysql-linestring-as-string
+    (let* ((data (subseq mysql-linestring-as-string
+                         11
+                         (- (length mysql-linestring-as-string) 1))))
+      (with-output-to-string (s)
+        (write-string "[" s)
+        (loop :for first := t :then nil
+           :for point :in (split-sequence:split-sequence #\, data)
+           :for (x y) := (split-sequence:split-sequence #\Space point)
+           :do (format s "~:[,~;~](~a,~a)" first x y))
+        (write-string "]" s)))))
+
+(defun integer-to-string (integer-string)
+  "Transform INTEGER-STRING parameter into a proper string representation of
+   it. In particular be careful of quoted-integers, thanks to SQLite default
+   values."
+  (declare (type (or null string fixnum) integer-string))
+  (when integer-string
+    (princ-to-string
+     (typecase integer-string
+       (integer integer-string)
+       (string  (handler-case
+                    (parse-integer integer-string :start 0)
+                  (condition (c)
+                    (declare (ignore c))
+                    (parse-integer integer-string :start 1
+                                   :end (- (length integer-string) 1)))))))))
+
 (defun float-to-string (float)
   "Transform a Common Lisp float value into its string representation as
    accepted by PostgreSQL, that is 100.0 rather than 100.0d0."
-  (declare (type (or null float string) float))
+  (declare (type (or null fixnum float string) float))
   (when float
     (typecase float
       (double-float (let ((*read-default-float-format* 'double-float))
                       (princ-to-string float)))
+      (string       float)
       (t            (princ-to-string float)))))
 
 (defun set-to-enum-array (set-string)
@@ -173,31 +281,41 @@
   (when string
     (string-right-trim '(#\Space) string)))
 
+(defun remove-null-characters (string)
+  "Remove NULL-characters (0x00) from STRING"
+  (when string
+    (remove #\Nul string)))
+
 (defun byte-vector-to-bytea (vector)
   "Transform a simple array of unsigned bytes to the PostgreSQL bytea
   representation as documented at
   http://www.postgresql.org/docs/9.3/interactive/datatype-binary.html
 
   Note that we choose here the bytea Hex Format."
-  (declare (type (or null (simple-array (unsigned-byte 8) (*))) vector))
-  (when vector
-    (let ((hex-digits "0123456789abcdef")
-	  (bytea (make-array (+ 2 (* 2 (length vector)))
-			     :initial-element #\0
-			     :element-type 'standard-char)))
+  (declare (type (or null string (simple-array (unsigned-byte 8) (*))) vector))
+  (etypecase vector
+    (null nil)
+    (string (if (string= "" vector)
+                nil
+                (error "byte-vector-to-bytea called on a string: ~s" vector)))
+    (simple-array
+     (let ((hex-digits "0123456789abcdef")
+           (bytea (make-array (+ 2 (* 2 (length vector)))
+                              :initial-element #\0
+                              :element-type 'standard-char)))
 
-      ;; The entire string is preceded by the sequence \x (to distinguish it
-      ;; from the escape format).
-      (setf (aref bytea 0) #\\)
-      (setf (aref bytea 1) #\x)
+       ;; The entire string is preceded by the sequence \x (to distinguish it
+       ;; from the escape format).
+       (setf (aref bytea 0) #\\)
+       (setf (aref bytea 1) #\x)
 
-      (loop for pos from 2 by 2
-	 for byte across vector
-	 do (let ((high (ldb (byte 4 4) byte))
-		  (low  (ldb (byte 4 0) byte)))
-	      (setf (aref bytea pos)       (aref hex-digits high))
-	      (setf (aref bytea (+ pos 1)) (aref hex-digits low)))
-	 finally (return bytea)))))
+       (loop for pos from 2 by 2
+          for byte across vector
+          do (let ((high (ldb (byte 4 4) byte))
+                   (low  (ldb (byte 4 0) byte)))
+               (setf (aref bytea pos)       (aref hex-digits high))
+               (setf (aref bytea (+ pos 1)) (aref hex-digits low)))
+          finally (return bytea))))))
 
 (defun ensure-parse-integer (string-or-integer)
   "Return an integer value if string-or-integer is an integer or a string
@@ -210,7 +328,7 @@
     (integer string-or-integer)))
 
 (defun sqlite-timestamp-to-timestamp (date-string-or-integer)
-  (declare (type (or integer simple-string) date-string-or-integer))
+  (declare (type (or null integer simple-string) date-string-or-integer))
   (when date-string-or-integer
     (cond ((and (typep date-string-or-integer 'integer)
                 (= 0 date-string-or-integer))
@@ -232,10 +350,40 @@
                    (t
                     date-string-or-integer)))))))
 
+;;;
+;;; MS SQL Server GUID binary representation is a mix of endianness, as
+;;; documented at
+;;; https://dba.stackexchange.com/questions/121869/sql-server-uniqueidentifier-guid-internal-representation
+;;; and
+;;; https://en.wikipedia.org/wiki/Globally_unique_identifier#Binary_encoding.
+;;;
+;;; "Other systems, notably Microsoft's marshalling of UUIDs in their
+;;;  COM/OLE libraries, use a mixed-endian format, whereby the first three
+;;;  components of the UUID are little-endian, and the last two are
+;;;  big-endian."
+;;;
+;;; So here we steal some code from the UUID lib and make it compatible with
+;;; this strange mix of endianness for SQL Server.
+;;;
+(defmacro arr-to-bytes-rev (from to array)
+  "Helper macro used in byte-array-to-uuid."
+  `(loop for i from ,to downto ,from
+      with res = 0
+      do (setf (ldb (byte 8 (* 8 (- i ,from))) res) (aref ,array i))
+      finally (return res)))
+
 (defun sql-server-uniqueidentifier-to-uuid (id)
   (declare (type (or null (array (unsigned-byte 8) (16))) id))
   (when id
-    (format nil "~a" (uuid:byte-array-to-uuid id))))
+    (let ((uuid
+           (make-instance 'uuid:uuid
+                          :time-low (arr-to-bytes-rev 0 3 id)
+                          :time-mid (arr-to-bytes-rev 4 5 id)
+                          :time-high (arr-to-bytes-rev 6 7 id)
+                          :clock-seq-var (aref id 8)
+                          :clock-seq-low (aref id 9)
+                          :node (uuid::arr-to-bytes 10 15 id))))
+      (princ-to-string uuid))))
 
 (defun unix-timestamp-to-timestamptz (unixtime-string)
   "Takes a unix timestamp (seconds since beginning of 1970) and converts it
@@ -265,3 +413,22 @@
            ((string= "((1))" bit-string-or-integer) "t")
            (t nil)))))
 
+(defun varbinary-to-string (string)
+  (let ((babel::*default-character-encoding*
+         (or qmynd::*mysql-encoding*
+             babel::*default-character-encoding*)))
+    (etypecase string
+      (null nil)
+      (string string)
+      (vector (babel:octets-to-string string)))))
+
+(defun base64-decode (string)
+  (etypecase string
+    (null    nil)
+    (string (base64:base64-string-to-string string))))
+
+(defun hex-to-dec (hex-string)
+  (etypecase hex-string
+    (null    nil)
+    (integer hex-string)
+    (string (write-to-string (parse-integer hex-string :radix 16)))))

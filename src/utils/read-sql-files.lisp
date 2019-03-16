@@ -116,7 +116,14 @@ Another test case for the classic quotes:
                (#\'       (case (parser-state state)
                             (:eat    (setf (parser-state state) :eqt))
                             (:esc    (setf (parser-state state) :eqt))
-                            (:eqt    (setf (parser-state state) :eat)))
+                            (:eqt    (setf (parser-state state) :eat))
+                            (:tag
+                             (progn
+                               ;; a tag name can't contain a single-quote
+                               ;; get back to previous state
+                               (let ((tag (pop-current-tag state)))
+                                 (format (parser-stream state) "$~a" tag))
+                               (reset-state state))))
 
                           (write-char char (parser-stream state)))
 
@@ -134,6 +141,7 @@ Another test case for the classic quotes:
                           ;; we act depending on the NEW state
                           (case (parser-state state)
                             (:eat (write-char char (parser-stream state)))
+                            (:edq (write-char char (parser-stream state)))
 
                             (:tag (push-new-tag state))
 
@@ -157,8 +165,17 @@ Another test case for the classic quotes:
                             (:eat      (setf (parser-state state) :eoq))
                             (otherwise (write-char char (parser-stream state)))))
 
-               (otherwise (cond ((member (parser-state state) '(:eat :eqt))
+               (otherwise (cond ((member (parser-state state) '(:eat :eqt :edq))
                                  (write-char char (parser-stream state)))
+
+                                ;; see
+                                ;; http://www.postgresql.org/docs/9.4/static/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS-ESCAPE
+                                ;; we re-inject whatever we read in the \x
+                                ;; syntax into the stream and let PostgreSQL
+                                ;; be the judge of what it means.
+                                ((member (parser-state state) '(:esc))
+                                 (write-char char (parser-stream state))
+                                 (setf (parser-state state) :eqt))
 
                                 ((member (parser-state state) '(:tag))
                                  ;; only letters are allowed in tags
@@ -166,9 +183,9 @@ Another test case for the classic quotes:
                                      (extend-current-tag state char)
 
                                      (progn
-                                      ;; not a tag actually: remove the
-                                      ;; parser-tags entry and push back its
-                                      ;; contents to the main output stream
+                                       ;; not a tag actually: remove the
+                                       ;; parser-tags entry and push back its
+                                       ;; contents to the main output stream
                                        (let ((tag (pop-current-tag state)))
                                          (format (parser-stream state)
                                                  "$~a~c"

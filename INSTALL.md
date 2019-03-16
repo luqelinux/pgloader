@@ -2,7 +2,7 @@
 
 pgloader version 3.x is written in Common Lisp.
 
-## The lisp parts
+## Dependencies
 
 The steps depend on the OS you are currently using.
 
@@ -23,7 +23,18 @@ You will note in particular:
 We need a recent enough [SBCL](http://sbcl.org/) version and that means
 backporting the one found in `sid` rather than using the very old one found
 in current *stable* debian release. See `bootstrap-debian.sh` for details
-about how to backport a recent enough SBCL here (1.1.14 or newer).
+about how to backport a recent enough SBCL here (1.2.5 or newer).
+
+### Redhat / CentOS
+
+You will need to install the Steel Bank Common Lisp package (sbcl) from EPEL, as 
+well as the freetds-devel package for some shared libraries. With RHEL/CentOS 6, 
+if the packaged version isn't >=1.3.6, you'll need to build it from source. With 
+v7, after installing freetds, you also need to create a softlink from the versioned
+shared library `libsybdb.so.5` to `libsybdb.so`. 
+
+The above steps are prepared for you with `boostrap-centos.sh` and `bootstrap-centos7.sh` respectively. 
+Please report to us if your standard RHEL/CentOS installation required additional steps.
 
 ### Mac OS X
 
@@ -60,9 +71,9 @@ Now that the dependences are installed, just type make.
 
     make
 
-If using Mac OS X, and depending on how you did install `SBCL` and which
-version you have (the brew default did change recently), you might need to
-ask the Makefile to refrain from trying to compress your binary image:
+If your `SBCL` supports core compression, the make process will use it
+to generate a smaller binary.  To force disabling core compression, you
+may use:
 
     make COMPRESS_CORE=no
 
@@ -92,65 +103,12 @@ Now the `./build/bin/pgloader` that you get only uses 1GB.
 
 ## Building a docker image
 
-We start with a `debian` image:
+A `Dockerfile` is provided, to use it:
 
-	docker run -it debian bash
+    docker build -t pgloader:debian .
+    docker run --rm --name pgloader pgloader:debian bash -c "pgloader --version"
 
-And then run the following steps:
-
-    # apt-get update
-    # apt-get install -y wget curl make git bzip2 time libzip-dev openssl-dev
-    # apt-get install -y patch unzip libsqlite3-dev gawk freetds-dev
-    # useradd -m -s /bin/bash dim
-    # su - dim
-    
-Install a binary version on SBCL, which unfortunately has no support for
-core compression, so only use it to build another SBCL version from sources
-with proper options:
-
-    $ mkdir sbcl
-    $ cd sbcl
-    $ wget http://prdownloads.sourceforge.net/sbcl/sbcl-1.2.6-x86-64-linux-binary.tar.bz2
-    $ wget http://prdownloads.sourceforge.net/sbcl/sbcl-1.2.6-source.tar.bz2?download
-    $ mv sbcl-1.2.6-source.tar.bz2\?download sbcl-1.2.6-source.tar.bz2
-    $ tar xf sbcl-1.2.6-x86-64-linux-binary.tar.bz2
-    $ tar xf sbcl-1.2.6-source.tar.bz2
-    $ exit
-    
-Install SBCL as root
-
-    # cd /home/dim/sbcl/sbcl-1.2.6-x86-64-linux
-    # bash install.sh
-
-Now back as the unprivileged user (dim) to compile SBCL from sources:
-
-    # su - dim
-    $ cd sbcl/sbcl-1.2.6
-    $ sh make.sh --with-sb-core-compression --with-sb-thread > build.out 2>&1
-    $ exit
-
-And install the newly compiled SBCL as root:
-
-    # cd /home/dim/sbcl/sbcl-1.2.6
-    # sh install.sh
-    
-Now build pgloader from sources:
-
-    # su - dim
-    $ git clone https://github.com/dimitri/pgloader
-    $ cd pgloader
-    $ make
-    $ ./build/bin/pgloader --help
-    $ exit
-
-Now install pgloader in `/usr/local/bin` to make it easy to use:
-
-    # cp /home/dim/pgloader/build/bin/pgloader /usr/local/bin
-    # pgloader --version
-
-Commit the docker instance and push it, from the host:
-
-    $ docker login
-    $ docker ps -l
-    $ docker commit <id> dimitri/pgloader-3.1.cd52654
-    $ docker push dimitri/pgloader-3.1.cd52654
+The `build` step install build dependencies in a debian jessie container,
+then `git clone` and build `pgloader` in `/opt/src/pgloader` and finally
+copy the resulting binary image in `/usr/local/bin/pgloader` so that it's
+easily available.

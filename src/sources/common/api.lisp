@@ -22,7 +22,12 @@
    (columns    :accessor columns	; list of columns, or nil
 	       :initarg :columns)	;
    (transforms :accessor transforms	; per-column transform functions
-	       :initarg :transforms))	;
+	       :initarg :transforms)    ;
+   (process-fn :accessor preprocessor   ; pre-processor function
+               :initarg :process-fn)    ;
+   (format     :accessor copy-format    ; format can be :COPY
+               :initarg :format         ; in which case no escaping
+               :initform :raw))         ; has to be done
   (:documentation "pgloader Generic Data Source"))
 
 (defmethod initialize-instance :after ((source copy) &key)
@@ -34,66 +39,91 @@
 	(setf (slot-value source 'transforms)
               (make-list (length (slot-value source 'columns))))))))
 
+(defgeneric concurrency-support (copy concurrency)
+  (:documentation
+   "Returns nil when no concurrency is supported, or a list of copy ojbects
+    prepared to run concurrently."))
+
 (defgeneric map-rows (source &key process-row-fn)
   (:documentation
    "Load data from SOURCE and funcall PROCESS-ROW-FUN for each row found in
     the SOURCE data. Each ROW is passed as a vector of objects."))
 
-(defgeneric copy-to-queue (source queue)
+(defgeneric proprocess-row (source)
   (:documentation
-   "Load data from SOURCE and queue each row into QUEUE. Typicall
-    implementation will directly use pgloader.queue:map-push-queue."))
+   "Some source readers have pre-processing to do on the raw data, such as
+    CSV user-defined field projections to PostgreSQL columns. This function
+    returns the pre-processing function, which must be a funcallable object."))
 
-(defgeneric copy-from (source &key truncate)
+(defgeneric queue-raw-data (source queue concurrency)
+  (:documentation "Send raw data from the reader to the worker queue."))
+
+(defgeneric data-is-preformatted-p (source)
   (:documentation
-   "Load data from SOURCE into its target as defined by the SOURCE object."))
+   "Process raw data from RAW-QUEUE and prepare batches of formatted text to
+    send down to PostgreSQL with the COPY protocol in FORMATTED-QUEUE."))
 
-;; That one is more an export than a load. It always export to a single very
-;; well defined format, the importing utility is defined in
-;; src/pgsql-copy-format.lisp
-
-(defgeneric copy-to (source filename)
+(defgeneric copy-column-list (source)
   (:documentation
-   "Load data from SOURCE and serialize it into FILENAME, using PostgreSQL
-    COPY TEXT format."))
+   "Return the list of column names for the data sent in the queue."))
 
-;; The next generic function is only to get instanciated for sources
-;; actually containing more than a single source item (tables, collections,
-;; etc)
 
-(defgeneric copy-database (source
-			   &key
-			     truncate
-			     data-only
-			     schema-only
-			     create-tables
-			     include-drop
-			     create-indexes
-			     reset-sequences)
-  (:documentation
-   "Auto-discover source schema, convert it to PostgreSQL, migrate the data
-    from the source definition to PostgreSQL for all the discovered
-    items (tables, collections, etc), then reset the PostgreSQL sequences
-    created by SERIAL columns in the first step.
-
-    The target tables are automatically discovered, the only-tables
-    parameter allows to filter them out."))
 
 
 ;;;
-;;; Common API to introspec a data source, when that's possible. Typically
-;;; when the source is a database system.
+;;; Class hierarchy allowing to share features among a subcategory of
+;;; pgloader sources. Those subcategory are divided in about the same set as
+;;; the connection types.
+;;;
+;;;   fd-connection: single file reader, copy
+;;;   md-connection: multiple file reader, md-copy
+;;;   db-connection: database connection reader, with introspection, db-copy
+;;;
+;;; Of those only md-copy objects share a lot in common, so we have another
+;;; layer of protocols just for them here, and the shared implementation
+;;; lives in md-methods.lisp in this directory.
 ;;;
 
-;; (defgeneric list-all-columns (connection &key)
-;;   (:documentation "Discover all columns in CONNECTION source."))
+(defclass md-copy (copy)
+  ((encoding    :accessor encoding	  ; file encoding
+	        :initarg :encoding)	  ;
+   (skip-lines  :accessor skip-lines	  ; skip firt N lines
+	        :initarg :skip-lines	  ;
+		:initform 0)		  ;
+   (header      :accessor header          ; CSV headers are col names
+                :initarg :header          ;
+                :initform nil))           ;
+  (:documentation "pgloader Multiple Files Data Source (csv, fixed, copy)."))
 
-;; (defgeneric list-all-indexes (connection &key)
-;;   (:documentation "Discover all indexes in CONNECTION source."))
+(defgeneric parse-header (md-copy)
+  (:documentation "Parse the file header and return a list of fields."))
 
-;; (defgeneric list-all-fkeys   (connection &key)
-;;   (:documentation "Discover all foreign keys in CONNECTION source."))
+(defgeneric process-rows (md-copy stream process-fn)
+  (:documentation "Process rows from a given input stream."))
 
-;; (defgeneric fetch-metadata (connection &key)
-;;   (:documentation "Full discovery of the CONNECTION data source."))
+(defgeneric clone-copy-for (md-copy path-spec)
+  (:documentation "Create a new instance for copying PATH-SPEC data."))
 
+
+;;;
+;;; Class hierarchy allowing to share features for database sources, where
+;;; we do introspection to prepare an internal catalog and then cast that
+;;; catalog to PostgreSQL before copying the data over.
+;;;
+(defclass db-copy (copy) ()
+  (:documentation "pgloader Database Data Source (MySQL, SQLite, MS SQL)."))
+
+(defgeneric fetch-metadata (db-copy catalog
+                            &key
+                              materialize-views
+                              only-tables
+                              create-indexes
+                              foreign-keys
+                              including
+                              excluding))
+
+(defgeneric cleanup (db-copy catalog &key materialize-views)
+  (:documentation "Clean-up after prepare-pgsql-database failure."))
+
+(defgeneric instanciate-table-copy-object (db-copy table)
+  (:documentation "Create a new instance for copying TABLE data."))

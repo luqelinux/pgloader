@@ -6,14 +6,38 @@
 
 (in-package #:pgloader.parser)
 
-(defrule option-create-table (and kw-create kw-table)
-  (:constant (cons :create-tables t)))
+(defrule tz-utc (~ "UTC") (:constant local-time:+utc-zone+))
+(defrule tz-gmt (~ "GMT") (:constant local-time:+gmt-zone+))
+(defrule tz-name (and #\' (+ (not #\')) #\')
+  (:lambda (tzn)
+    (bind (((_ chars _) tzn))
+      (local-time:reread-timezone-repository)
+      (local-time:find-timezone-by-location-name (text chars)))))
 
-;;; piggyback on DBF parsing
-(defrule ixf-options (and kw-with dbf-option-list)
-  (:lambda (source)
-    (bind (((_ opts) source))
-      (cons :ixf-options opts))))
+(defrule option-timezone (and kw-timezone (or tz-utc tz-gmt tz-name))
+  (:lambda (tzopt)
+    (bind (((_ tz) tzopt)) (cons :timezone tz))))
+
+(defrule ixf-option (or option-on-error-stop
+                        option-on-error-resume-next
+                        option-workers
+                        option-concurrency
+                        option-batch-rows
+                        option-batch-size
+                        option-prefetch-rows
+                        option-truncate
+                        option-disable-triggers
+                        option-identifiers-case
+                        option-data-only
+                        option-schema-only
+                        option-include-drop
+                        option-create-table
+                        option-create-tables
+                        option-table-name
+                        option-timezone))
+
+(defrule ixf-options (and kw-with (and ixf-option (* (and comma ixf-option))))
+  (:function flatten-option-list))
 
 (defrule ixf-uri (and "ixf://" filename)
   (:lambda (source)
@@ -39,51 +63,59 @@
   (:lambda (clauses-list)
     (alexandria:alist-plist clauses-list)))
 
-(defrule load-ixf-command (and ixf-source target load-ixf-optional-clauses)
+(defrule load-ixf-command (and ixf-source
+                               target
+                               (? csv-target-table)
+                               load-ixf-optional-clauses)
   (:lambda (command)
-    (destructuring-bind (source target clauses) command
-      `(,source ,target ,@clauses))))
+    (destructuring-bind (source pguri table-name clauses) command
+      (list* source
+             pguri
+             (or table-name (pgconn-table-name pguri))
+             clauses))))
 
 (defun lisp-code-for-loading-from-ixf (ixf-db-conn pg-db-conn
                                        &key
-                                         gucs before after
-                                         ((:ixf-options options)))
+                                         target-table-name
+                                         gucs before after options
+                                         &allow-other-keys)
   `(lambda ()
-     (let* ((state-before   (pgloader.utils:make-pgstate))
-            (summary        (null *state*))
-            (*state*        (or *state* (pgloader.utils:make-pgstate)))
-            (state-after   ,(when after `(pgloader.utils:make-pgstate)))
-            ,@(pgsql-connection-bindings pg-db-conn gucs)
+     (let* (,@(pgsql-connection-bindings pg-db-conn gucs)
             ,@(batch-control-bindings options)
-            ,@(identifier-case-binding options)
-            (table-name    ,(pgconn-table-name pg-db-conn))
-            (source-db      (with-stats-collection ("fetch" :state state-before)
+              ,@(identifier-case-binding options)
+              (timezone     (getf ',options :timezone))
+              (on-error-stop(getf ',options :on-error-stop))
+              (source-db    (with-stats-collection ("fetch" :section :pre)
                               (expand (fetch-file ,ixf-db-conn))))
-            (source
-             (make-instance 'pgloader.ixf:copy-ixf
-                            :target-db ,pg-db-conn
-                            :source-db source-db
-                            :target table-name)))
+              (source
+               (make-instance 'copy-ixf
+                              :target-db ,pg-db-conn
+                              :source-db source-db
+                              :target (create-table ',target-table-name)
+                              :timezone timezone)))
 
-       ,(sql-code-block pg-db-conn 'state-before before "before load")
+       ,(sql-code-block pg-db-conn :pre before "before load")
 
-       (pgloader.sources:copy-database source
-                                       :state-before state-before
-                                       ,@(remove-batch-control-option options))
+       (copy-database source
+                      ,@(remove-batch-control-option
+                         options
+                         :extras '(:timezone))
+                      :on-error-stop on-error-stop
+                      :foreign-keys nil
+                      :reset-sequences nil)
 
-       ,(sql-code-block pg-db-conn 'state-after after "after load")
-
-       (when summary
-         (report-full-summary "Total import time" *state*
-                              :before state-before
-                              :finally state-after)))))
+       ,(sql-code-block pg-db-conn :post after "after load"))))
 
 (defrule load-ixf-file load-ixf-command
   (:lambda (command)
-    (bind (((source pg-db-uri
-                    &key ((:ixf-options options)) gucs before after) command))
-      (lisp-code-for-loading-from-ixf source pg-db-uri
-                                      :gucs gucs
-                                      :before before
-                                      :after after
-                                      :ixf-options options))))
+    (bind (((source pg-db-uri table-name
+                    &key options gucs before after) command))
+      (cond (*dry-run*
+             (lisp-code-for-csv-dry-run pg-db-uri))
+            (t
+             (lisp-code-for-loading-from-ixf source pg-db-uri
+                                             :target-table-name table-name
+                                             :gucs gucs
+                                             :before before
+                                             :after after
+                                             :options options))))))

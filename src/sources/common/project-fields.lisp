@@ -20,14 +20,13 @@
 		       nil
 		       col))
 		 (lambda (col)
-		   (declare (optimize speed))
 		   (if (string= null-as col) nil col))))
 
 	   (field-name-as-symbol (field-name-or-list)
 	     "we need to deal with symbols as we generate code"
 	     (typecase field-name-or-list
-	       (list (pgloader.transforms:intern-symbol (car field-name-or-list)))
-	       (t    (pgloader.transforms:intern-symbol field-name-or-list))))
+	       (list (intern-symbol (car field-name-or-list)))
+	       (t    (intern-symbol field-name-or-list))))
 
 	   (process-field (field-name-or-list)
 	     "Given a field entry, return a function dealing with nulls for it"
@@ -41,7 +40,6 @@
 		   (list (cdr field-name-or-list))
 		   (t    (cdr (assoc field-name-or-list fields
                                      :test #'string-equal))))
-	       (declare (ignore date-format)) ; TODO
                ;; now prepare a function of a column
                (lambda (col)
                  (let ((value-or-null
@@ -103,15 +101,21 @@
                                    `(funcall ,(process-field field-name)
                                              ,field-name))))
 		      (newrow
-		       (loop for (name type fn) in columns
+		       (loop for (name type sexp) in columns
 			  collect
 			  ;; we expect the name of a COLUMN to be the same
 			  ;; as the name of its derived FIELD when we
 			  ;; don't have any transformation function
-			    (or fn `(funcall ,(process-field name)
-					     ,(field-name-as-symbol name))))))
+                            (typecase sexp
+                              (null   (field-name-as-symbol name))
+                              (string (if (assoc sexp fields :test #'string=)
+                                          ;; col text using "Field-Name"
+                                          (field-name-as-symbol sexp)
+                                          ;; col text using "Constant String"
+                                          sexp))
+                              (t      sexp)))))
 		 `(lambda (row)
-		    (declare (optimize speed) (type list row))
+		    (declare (type list row))
 		    (destructuring-bind (&optional ,@args &rest extra) row
 		      (declare (ignorable ,@args) (ignore extra))
                       (let ,values
@@ -120,29 +124,21 @@
       ;; allow for some debugging
       (if compile (compile nil projection) projection))))
 
-(defun reformat-then-process (&key fields columns target process-row-fn)
+(defun reformat-then-process (&key fields columns target)
   "Return a lambda form to apply to each row we read.
 
    The lambda closes over the READ paramater, which is a counter of how many
    lines we did read in the file."
   (let ((projection (project-fields :fields fields :columns columns)))
     (lambda (row)
-      (pgstate-incf *state* target :read 1)
       ;; cl-csv returns (nil) for an empty line
       (if (or (null row)
               (and (null (car row)) (null (cdr row))))
-          (log-message :notice "Skipping empty line ~d."
-                       (pgloader.utils::pgtable-read
-                        (pgstate-get-table *state* target)))
-          (let ((projected-vector
-                 (handler-case
-                     (funcall projection row)
-                   (condition (e)
-                     (pgstate-incf *state* target :errs 1)
-                     (log-message :error "Could not read line ~d: ~a"
-                                  (pgloader.utils::pgtable-read
-                                   (pgstate-get-table *state* target))
-                                  e)))))
-            (when projected-vector
-              (funcall process-row-fn projected-vector)))))))
+          (log-message :notice "Skipping empty line.")
+
+          (handler-case
+              (funcall projection row)
+            (condition (e)
+              (update-stats :data target :errs 1)
+              (log-message :error "Could not read input: ~a" e)))))))
 

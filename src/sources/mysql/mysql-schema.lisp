@@ -2,114 +2,8 @@
 ;;; Tools to query the MySQL Schema to reproduce in PostgreSQL
 ;;;
 
-(in-package :pgloader.mysql)
+(in-package :pgloader.source.mysql)
 
-(defvar *connection* nil "Current MySQL connection")
-
-
-;;;
-;;; Specific implementation of schema migration, see the API in
-;;; src/pgsql/schema.lisp
-;;;
-(defstruct (mysql-column
-	     (:constructor make-mysql-column
-			   (table-name name dtype ctype default nullable extra)))
-  table-name name dtype ctype default nullable extra)
-
-(defmethod format-pgsql-column ((col mysql-column))
-  "Return a string representing the PostgreSQL column definition."
-  (let* ((column-name (apply-identifier-case (mysql-column-name col)))
-	 (type-definition
-	  (with-slots (table-name name dtype ctype default nullable extra)
-	      col
-	    (cast table-name name dtype ctype default nullable extra))))
-    (format nil "~a ~22t ~a" column-name type-definition)))
-
-(defmethod format-extra-type ((col mysql-column) &key include-drop)
-  "Return a string representing the extra needed PostgreSQL CREATE TYPE
-   statement, if such is needed"
-  (let ((dtype (mysql-column-dtype col)))
-    (when (or (string-equal "enum" dtype)
-	      (string-equal "set" dtype))
-      (list
-       (when include-drop
-	 (let* ((type-name
-		 (get-enum-type-name (mysql-column-table-name col)
-				     (mysql-column-name col))))
-		 (format nil "DROP TYPE IF EXISTS ~a;" type-name)))
-
-       (get-create-enum (mysql-column-table-name col)
-			(mysql-column-name col)
-			(mysql-column-ctype col))))))
-
-
-;;;
-;;; General utility to manage MySQL connection
-;;;
-(defclass mysql-connection (db-connection) ())
-
-(defmethod initialize-instance :after ((myconn mysql-connection) &key)
-  "Assign the type slot to mysql."
-  (setf (slot-value myconn 'type) "mysql"))
-
-(defmethod open-connection ((myconn mysql-connection) &key)
-  (setf (conn-handle myconn)
-        (if (and (consp (db-host myconn)) (eq :unix (car (db-host myconn))))
-            (qmynd:mysql-local-connect :path (cdr (db-host myconn))
-                                       :username (db-user myconn)
-                                       :password (db-pass myconn)
-                                       :database (db-name myconn))
-            (qmynd:mysql-connect :host (db-host myconn)
-                                 :port (db-port myconn)
-                                 :username (db-user myconn)
-                                 :password (db-pass myconn)
-                                 :database (db-name myconn))))
-  ;; return the connection object
-  myconn)
-
-(defmethod close-connection ((myconn mysql-connection))
-  (qmynd:mysql-disconnect (conn-handle myconn))
-  (setf (conn-handle myconn) nil)
-  myconn)
-
-(defun mysql-query (query &key row-fn (as-text t) (result-type 'list))
-  "Execute given QUERY within the current *connection*, and set proper
-   defaults for pgloader."
-  (qmynd:mysql-query (conn-handle *connection*) query
-                     :row-fn row-fn
-                     :as-text as-text
-                     :result-type result-type))
-
-;;;
-;;; Function for accessing the MySQL catalogs, implementing auto-discovery.
-;;;
-;;; Interactive use only, will create its own database connection.
-;;;
-;; (defun list-databases ()
-;;   "Connect to a local database and get the database list"
-;;   (with-mysql-connection ()
-;;     (mysql-query "show databases")))
-
-;; (defun list-tables (dbname)
-;;   "Return a flat list of all the tables names known in given DATABASE"
-;;   (with-mysql-connection (dbname)
-;;     (mysql-query (format nil "
-;;   select table_name
-;;     from information_schema.tables
-;;    where table_schema = '~a' and table_type = 'BASE TABLE'
-;; order by table_name" dbname))))
-
-;; (defun list-views (dbname &key only-tables)
-;;   "Return a flat list of all the view names and definitions known in given DBNAME"
-;;   (with-mysql-connection (dbname)
-;;     (mysql-query (format nil "
-;;   select table_name, view_definition
-;;     from information_schema.views
-;;    where table_schema = '~a'
-;;          ~@[and table_name in (~{'~a'~^,~})~]
-;; order by table_name" dbname only-tables))))
-
-
 ;;;
 ;;; Those functions are to be called from withing an already established
 ;;; MySQL Connection.
@@ -128,7 +22,20 @@
           for sql = (format nil "CREATE VIEW ~a AS ~a" name def)
           do
             (log-message :info "MySQL: ~a" sql)
-            (mysql-query sql))))))
+            #+pgloader-image
+            (mysql-query sql)
+            #-pgloader-image
+            (restart-case
+                (mysql-query sql)
+              (use-existing-view ()
+                :report "Use the already existing view and continue"
+                nil)
+              (replace-view ()
+                :report "Replace the view with the one from pgloader's command"
+                (let ((drop-sql (format nil "DROP VIEW ~a;" name)))
+                  (log-message :info "MySQL: ~a" drop-sql)
+                  (mysql-query drop-sql)
+                  (mysql-query sql)))))))))
 
 (defun drop-my-views (views-alist)
   "See `create-my-views' for VIEWS-ALIST description. This time we DROP the
@@ -158,8 +65,15 @@
   "Given an INCLUDING or EXCLUDING clause, turn it into a MySQL WHERE clause."
   (mapcar (lambda (filter)
             (typecase filter
-              (string (format nil "~:[~;!~]= '~a'" not filter))
-              (cons   (format nil "~:[~;NOT ~]REGEXP '~a'" not (cadr filter)))))
+              (string-match-rule
+               (format nil "~:[~;!~]= '~a'"
+                       not
+                       (string-match-rule-target filter)))
+
+              (regex-match-rule
+               (format nil "~:[~;NOT ~]REGEXP '~a'"
+                       not
+                       (regex-match-rule-target filter)))))
           filter-list))
 
 (defun cleanup-default-value (dtype default)
@@ -169,9 +83,10 @@
          (when default
            (babel:string-to-octets default)))
 
-        (t default)))
+        (t (ensure-unquoted default #\'))))
 
-(defun list-all-columns (&key
+(defun list-all-columns (schema
+                         &key
 			   (table-type :table)
 			   only-tables
                            including
@@ -180,150 +95,111 @@
 			   (table-type-name (cdr (assoc table-type *table-type*))))
   "Get the list of MySQL column names per table."
   (loop
-     with schema = nil
-     for (table-name name dtype ctype default nullable extra)
-     in
-       (mysql-query (format nil "
-  select c.table_name, c.column_name,
-         c.data_type, c.column_type, c.column_default,
-         c.is_nullable, c.extra
-    from information_schema.columns c
-         join information_schema.tables t using(table_schema, table_name)
-   where c.table_schema = '~a' and t.table_type = '~a'
-         ~:[~*~;and table_name in (~{'~a'~^,~})~]
-         ~:[~*~;and (~{table_name ~a~^ or ~})~]
-         ~:[~*~;and (~{table_name ~a~^ and ~})~]
-order by table_name, ordinal_position"
-                            (db-name *connection*)
-                            table-type-name
-                            only-tables ; do we print the clause?
-                            only-tables
-                            including   ; do we print the clause?
-                            (filter-list-to-where-clause including)
-                            excluding   ; do we print the clause?
-                            (filter-list-to-where-clause excluding t)))
-     do
-       (let* ((entry   (assoc table-name schema :test 'equal))
-              (def-val (cleanup-default-value dtype default))
-              (column  (make-mysql-column
-                        table-name name dtype ctype def-val nullable extra)))
-         (if entry
-             (push column (cdr entry))
-             (push (cons table-name (list column)) schema)))
-     finally
-     ;; we did push, we need to reverse here
-       (return (loop
-                  for name in (if only-tables only-tables
-                                  (reverse (mapcar #'car schema)))
-                  for cols = (cdr (assoc name schema :test #'string=))
-                  collect (cons name (reverse cols))))))
+     :for (tname tcomment cname ccomment dtype ctype default nullable extra)
+     :in
+     (mysql-query (format nil
+                          (sql "/mysql/list-all-columns.sql")
+                          (db-name *connection*)
+                          table-type-name
+                          only-tables   ; do we print the clause?
+                          only-tables
+                          including     ; do we print the clause?
+                          (filter-list-to-where-clause including)
+                          excluding     ; do we print the clause?
+                          (filter-list-to-where-clause excluding t)))
+     :do
+     (let* ((table
+             (case table-type
+               (:view (maybe-add-view schema tname :comment tcomment))
+               (:table (maybe-add-table schema tname :comment tcomment))))
+            (def-val (cleanup-default-value dtype default))
+            (field   (make-mysql-column
+                      tname cname (unless (or (null ccomment)
+                                              (string= "" ccomment))
+                                    ccomment)
+                      dtype ctype def-val nullable
+                      (normalize-extra extra))))
+       (add-field table field))
+     :finally
+     (return schema)))
 
-(defun list-all-indexes (&key
+(defun list-all-indexes (schema
+                         &key
                            only-tables
                            including
                            excluding)
   "Get the list of MySQL index definitions per table."
   (loop
-     with schema = nil
-     for (table-name name non-unique cols)
-     in (mysql-query (format nil "
-  SELECT table_name, index_name, non_unique,
-         cast(GROUP_CONCAT(column_name order by seq_in_index) as char)
-    FROM information_schema.statistics
-   WHERE table_schema = '~a'
-         ~:[~*~;and table_name in (~{'~a'~^,~})~]
-         ~:[~*~;and (~{table_name ~a~^ or ~})~]
-         ~:[~*~;and (~{table_name ~a~^ and ~})~]
-GROUP BY table_name, index_name;"
-                             (db-name *connection*)
-                             only-tables ; do we print the clause?
-                             only-tables
-                             including  ; do we print the clause?
-                             (filter-list-to-where-clause including)
-                             excluding  ; do we print the clause?
-                             (filter-list-to-where-clause excluding t)))
-     do (let ((entry (assoc table-name schema :test 'equal))
-              (index
-               (make-pgsql-index :name name
-                                 :primary (string= name "PRIMARY")
-                                 :table-name table-name
-                                 :unique (not (string= "1" non-unique))
-                                 :columns (sq:split-sequence #\, cols))))
-          (if entry
-              (push index (cdr entry))
-              (push (cons table-name (list index)) schema)))
-     finally
-     ;; we did push, we need to reverse here
-       (return (reverse (loop
-                           for (name . indexes) in schema
-                           collect (cons name (reverse indexes)))))))
+     :for (table-name name index-type non-unique cols)
+     :in (mysql-query (format nil
+                              (sql "/mysql/list-all-indexes.sql")
+                              (db-name *connection*)
+                              only-tables ; do we print the clause?
+                              only-tables
+                              including ; do we print the clause?
+                              (filter-list-to-where-clause including)
+                              excluding ; do we print the clause?
+                              (filter-list-to-where-clause excluding t)))
+     :do (let* ((table (find-table schema table-name))
+                (index
+                 (make-index :name name ; further processing is needed
+                             :schema schema
+                             :table table
+                             :type index-type
+                             :primary (string= name "PRIMARY")
+                             :unique (string= "0" non-unique)
+                             :columns (mapcar
+                                       #'apply-identifier-case
+                                       (sq:split-sequence #\, cols)))))
+           (add-index table index))
+     :finally
+     (return schema)))
 
 ;;;
 ;;; MySQL Foreign Keys
 ;;;
-(defun list-all-fkeys (&key
+(defun list-all-fkeys (schema
+                       &key
                          only-tables
                          including
                          excluding)
   "Get the list of MySQL Foreign Keys definitions per table."
   (loop
-     with schema = nil
-     for (table-name name ftable cols fcols update-rule delete-rule)
-     in (mysql-query (format nil "
-    SELECT tc.table_name, tc.constraint_name, k.referenced_table_name ft,
-
-           group_concat(         k.column_name
-                        order by k.ordinal_position) as cols,
-
-           group_concat(         k.referenced_column_name
-                        order by k.position_in_unique_constraint) as fcols,
-
-           rc.update_rule, rc.delete_rule
-
-      FROM information_schema.table_constraints tc
-
-           JOIN information_schema.referential_constraints rc
-             ON rc.constraint_schema = tc.table_schema
-            AND rc.constraint_name = tc.constraint_name
-            AND rc.table_name = tc.table_name
-
-      LEFT JOIN information_schema.key_column_usage k
-             ON k.table_schema = tc.table_schema
-            AND k.table_name = tc.table_name
-            AND k.constraint_name = tc.constraint_name
-
-    WHERE     tc.table_schema = '~a'
-          AND k.referenced_table_schema = '~a'
-          AND tc.constraint_type = 'FOREIGN KEY'
-         ~:[~*~;and tc.table_name in (~{'~a'~^,~})~]
-         ~:[~*~;and (~{tc.table_name ~a~^ or ~})~]
-         ~:[~*~;and (~{tc.table_name ~a~^ and ~})~]
-
- GROUP BY tc.table_name, tc.constraint_name, ft"
-                             (db-name *connection*) (db-name *connection*)
-                             only-tables ; do we print the clause?
-                             only-tables
-                             including  ; do we print the clause?
-                             (filter-list-to-where-clause including)
-                             excluding  ; do we print the clause?
-                             (filter-list-to-where-clause excluding t)))
-     do (let ((entry (assoc table-name schema :test 'equal))
-              (fk
-               (make-pgsql-fkey :name name
-                                :table-name table-name
-                                :columns (sq:split-sequence #\, cols)
-                                :foreign-table ftable
-                                :foreign-columns (sq:split-sequence #\, fcols)
-                                :update-rule update-rule
-                                :delete-rule delete-rule)))
-          (if entry
-              (push fk (cdr entry))
-              (push (cons table-name (list fk)) schema)))
-     finally
-     ;; we did push, we need to reverse here
-       (return (reverse (loop
-                           for (name . fks) in schema
-                           collect (cons name (reverse fks)))))))
+     :for (table-name name ftable-name cols fcols update-rule delete-rule)
+     :in (mysql-query (format nil
+                              (sql "/mysql/list-all-fkeys.sql")
+                              (db-name *connection*) (db-name *connection*)
+                              only-tables ; do we print the clause?
+                              only-tables
+                              including ; do we print the clause?
+                              (filter-list-to-where-clause including)
+                              excluding ; do we print the clause?
+                              (filter-list-to-where-clause excluding t)))
+     :do (let* ((table  (find-table schema table-name))
+                (ftable (find-table schema ftable-name))
+                (fk
+                 (make-fkey :name (apply-identifier-case name)
+                            :table table
+                            :columns (mapcar #'apply-identifier-case
+                                             (sq:split-sequence #\, cols))
+                            :foreign-table ftable
+                            :foreign-columns (mapcar
+                                              #'apply-identifier-case
+                                              (sq:split-sequence #\, fcols))
+                            :update-rule update-rule
+                            :delete-rule delete-rule)))
+           (if (and name table ftable)
+               (add-fkey table fk)
+               ;; chances are this comes from the EXCLUDING clause, but
+               ;; we'll make for it in fetching missing dependencies for
+               ;; (unique) indexes
+               (log-message :info
+                            "Incomplete Foreign Key definition: constraint ~s on table ~s referencing table ~s"
+                            name
+                            (when table (format-table-name table))
+                            (when ftable (format-table-name ftable)))))
+     :finally
+     (return schema)))
 
 
 ;;;
@@ -339,14 +215,8 @@ GROUP BY table_name, index_name;"
   "Return comments on MySQL tables."
   (loop
      :for (table-name comment)
-     :in (mysql-query (format nil "
-    SELECT table_name, table_comment
-      FROM information_schema.tables
-    WHERE     table_schema = '~a'
-          and table_type = 'BASE TABLE'
-         ~:[~*~;and table_name in (~{'~a'~^,~})~]
-         ~:[~*~;and (~{table_name ~a~^ or ~})~]
-         ~:[~*~;and (~{table_name ~a~^ and ~})~]"
+     :in (mysql-query (format nil
+                              (sql "/mysql/list-table-comments.sql")
                               (db-name *connection*)
                               only-tables ; do we print the clause?
                               only-tables
@@ -364,16 +234,8 @@ GROUP BY table_name, index_name;"
   "Return comments on MySQL tables."
   (loop
      :for (table-name column-name comment)
-     :in (mysql-query (format nil "
-  select c.table_name, c.column_name, c.column_comment
-    from information_schema.columns c
-         join information_schema.tables t using(table_schema, table_name)
-   where     c.table_schema = '~a'
-         and t.table_type = 'BASE TABLE'
-         ~:[~*~;and table_name in (~{'~a'~^,~})~]
-         ~:[~*~;and (~{table_name ~a~^ or ~})~]
-         ~:[~*~;and (~{table_name ~a~^ and ~})~]
-order by table_name, ordinal_position"
+     :in (mysql-query (format nil
+                              (sql "/mysql/list-columns-comments.sql")
                               (db-name *connection*)
                               only-tables ; do we print the clause?
                               only-tables
@@ -395,23 +257,17 @@ order by table_name, ordinal_position"
    Mostly we just use the name, but in case of POINT we need to use
    astext(name)."
   (case (intern (string-upcase type) "KEYWORD")
-    (:point  (format nil "astext(`~a`) as `~a`" name name))
-    (t       (format nil "`~a`" name))))
+    (:geometry   (format nil "astext(`~a`) as `~a`" name name))
+    (:point      (format nil "astext(`~a`) as `~a`" name name))
+    (:linestring (format nil "astext(`~a`) as `~a`" name name))
+    (t           (format nil "`~a`" name))))
 
-(defun get-column-list (dbname table-name)
+(defun get-column-list (copy)
   "Some MySQL datatypes have a meaningless default output representation, we
-   need to process them on the SQL side (geometric data types).
-
-   This function assumes a valid connection to the MySQL server has been
-   established already."
-  (loop
-     for (name type) in (mysql-query (format nil "
-  select column_name, data_type
-    from information_schema.columns
-   where table_schema = '~a' and table_name = '~a'
-order by ordinal_position" dbname table-name)
-					   :result-type 'list)
-     collect (get-column-sql-expression name type)))
+   need to process them on the SQL side (geometric data types)."
+  (loop :for field :in (fields copy)
+     :collect (get-column-sql-expression (mysql-column-name field)
+                                         (mysql-column-dtype field))))
 
 (declaim (inline fix-nulls))
 

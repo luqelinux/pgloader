@@ -1,7 +1,9 @@
 LOAD IXF
     FROM data/nsitra.test1.ixf
-    INTO postgresql:///pgloader?nsitra.test1
-    WITH truncate, create table
+    INTO postgresql:///pgloader
+    TARGET TABLE nsitra.test1
+    
+    WITH on error stop, truncate, create table, timezone UTC
 
   BEFORE LOAD DO
    $$ drop schema if exists nsitra cascade; $$,

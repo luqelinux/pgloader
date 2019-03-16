@@ -32,23 +32,14 @@
 (defrule maybe-quoted-filename (or quoted-filename filename)
   (:identity t))
 
-(defrule http-uri (and "http://" (* (filename-character-p character)))
+(defrule http-uri (and (or "http://" "https://")
+                       (* (filename-character-p character)))
   (:destructure (prefix url)
     (list :http (concatenate 'string prefix url))))
 
 (defrule maybe-quoted-filename-or-http-uri (or http-uri maybe-quoted-filename))
 
-(defrule get-filename-or-http-uri-from-environment-variable (and kw-getenv name)
-  (:lambda (p-e-v)
-    (destructuring-bind (g varname) p-e-v
-      (declare (ignore g))
-      (let ((connstring (getenv-default varname)))
-        (unless connstring
-          (error "Environment variable ~s is unset." varname))
-        (parse 'maybe-quoted-filename-or-http-uri connstring)))))
-
-(defrule filename-or-http-uri (or get-filename-or-http-uri-from-environment-variable
-                                  maybe-quoted-filename-or-http-uri))
+(defrule filename-or-http-uri maybe-quoted-filename-or-http-uri)
 
 (defrule source-uri (or stdin
 			http-uri

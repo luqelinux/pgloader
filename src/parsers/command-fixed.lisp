@@ -19,10 +19,10 @@
 (defrule number (or hex-number dec-number))
 
 (defrule field-start-position (and (? kw-from) ignore-whitespace number)
-  (:destructure (from ws pos) (declare (ignore from ws)) pos))
+  (:function third))
 
 (defrule fixed-field-length (and (? kw-for) ignore-whitespace number)
-  (:destructure (for ws len) (declare (ignore for ws)) len))
+  (:function third))
 
 (defrule fixed-source-field (and csv-field-name
 				 field-start-position fixed-field-length
@@ -43,31 +43,28 @@
   (:lambda (source)
     (bind (((_ field-defs _) source)) field-defs)))
 
-(defrule fixed-option (or option-batch-rows
+(defrule fixed-option (or option-on-error-stop
+                          option-on-error-resume-next
+                          option-workers
+                          option-concurrency
+                          option-batch-rows
                           option-batch-size
-                          option-batch-concurrency
+                          option-prefetch-rows
+                          option-max-parallel-create-index
                           option-truncate
+                          option-drop-indexes
                           option-disable-triggers
+                          option-identifiers-case
 			  option-skip-header))
 
-(defrule another-fixed-option (and comma fixed-option)
-  (:lambda (source)
-    (bind (((_ option) source)) option)))
-
-(defrule fixed-option-list (and fixed-option (* another-fixed-option))
-  (:lambda (source)
-    (destructuring-bind (opt1 opts) source
-      (alexandria:alist-plist `(,opt1 ,@opts)))))
-
-(defrule fixed-options (and kw-with csv-option-list)
-  (:lambda (source)
-    (bind (((_ opts) source))
-      (cons :fixed-options opts))))
+(defrule fixed-options (and kw-with
+                            (and fixed-option (* (and comma fixed-option))))
+  (:function flatten-option-list))
 
 (defrule fixed-uri (and "fixed://" filename)
   (:lambda (source)
     (bind (((_ filename) source))
-      (make-instance 'fixed-connection :specs filename))))
+      (make-instance 'fixed-connection :spec filename))))
 
 (defrule fixed-file-source (or stdin
 			       inline
@@ -79,23 +76,13 @@
     (if (typep src 'fixed-connection) src
         (destructuring-bind (type &rest specs) src
           (case type
-            (:stdin    (make-instance 'fixed-connection :specs src))
-            (:inline   (make-instance 'fixed-connection :specs src))
-            (:filename (make-instance 'fixed-connection :specs src))
-            (:regex    (make-instance 'fixed-connection :specs src))
+            (:stdin    (make-instance 'fixed-connection :spec src))
+            (:inline   (make-instance 'fixed-connection :spec src))
+            (:filename (make-instance 'fixed-connection :spec src))
+            (:regex    (make-instance 'fixed-connection :spec src))
             (:http     (make-instance 'fixed-connection :uri (first specs))))))))
 
-(defrule get-fixed-file-source-from-environment-variable (and kw-getenv name)
-  (:lambda (p-e-v)
-    (bind (((_ varname) p-e-v)
-           (connstring (getenv-default varname)))
-      (unless connstring
-          (error "Environment variable ~s is unset." varname))
-        (parse 'fixed-file-source connstring))))
-
-(defrule fixed-source (and kw-load kw-fixed kw-from
-                           (or get-fixed-file-source-from-environment-variable
-                               fixed-file-source))
+(defrule fixed-source (and kw-load kw-fixed kw-from fixed-file-source)
   (:lambda (src)
     (bind (((_ _ _ source) src)) source)))
 
@@ -109,63 +96,82 @@
 (defrule load-fixed-cols-file-command (and fixed-source (? file-encoding)
                                            fixed-source-field-list
                                            target
+                                           (? csv-target-table)
                                            (? csv-target-column-list)
                                            load-fixed-cols-file-optional-clauses)
   (:lambda (command)
-    (destructuring-bind (source encoding fields target columns clauses) command
-      `(,source ,encoding ,fields ,target ,columns ,@clauses))))
+    (destructuring-bind (source encoding fields pguri table-name columns clauses)
+        command
+      (list* source
+             encoding
+             fields
+             pguri
+             (or table-name (pgconn-table-name pguri))
+             columns
+             clauses))))
 
-(defun lisp-code-for-loading-from-fixed (fixed-conn fields pg-db-conn
+(defun lisp-code-for-loading-from-fixed (fixed-conn pg-db-conn
                                          &key
                                            (encoding :utf-8)
+                                           fields
+                                           target-table-name
                                            columns
-                                           gucs before after
-                                           ((:fixed-options options)))
+                                           gucs before after options
+                                         &allow-other-keys
+                                         &aux
+                                           (worker-count (getf options :worker-count))
+                                           (concurrency  (getf options :concurrency)))
   `(lambda ()
-     (let* ((state-before  (pgloader.utils:make-pgstate))
-            (summary       (null *state*))
-            (*state*       (or *state* (pgloader.utils:make-pgstate)))
-            (state-after   ,(when after `(pgloader.utils:make-pgstate)))
-            ,@(pgsql-connection-bindings pg-db-conn gucs)
+     (let* (,@(pgsql-connection-bindings pg-db-conn gucs)
             ,@(batch-control-bindings options)
-            (source-db     (with-stats-collection ("fetch" :state state-before)
-                               (expand (fetch-file ,fixed-conn)))))
+              ,@(identifier-case-binding options)
+              (source-db (with-stats-collection ("fetch" :section :pre)
+                           (expand (fetch-file ,fixed-conn)))))
 
        (progn
-         ,(sql-code-block pg-db-conn 'state-before before "before load")
+         ,(sql-code-block pg-db-conn :pre before "before load")
 
-         (let ((truncate ,(getf options :truncate))
-               (disable-triggers ,(getf options :disable-triggers))
+         (let ((on-error-stop                 ,(getf options :on-error-stop))
+               (truncate                      ,(getf options :truncate))
+               (disable-triggers              ,(getf options :disable-triggers))
+               (drop-indexes                  ,(getf options :drop-indexes))
+               (max-parallel-create-index     ,(getf options :max-parallel-create-index))
                (source
-                (make-instance 'pgloader.fixed:copy-fixed
+                (make-instance 'copy-fixed
                                :target-db ,pg-db-conn
                                :source source-db
-                               :target ,(pgconn-table-name pg-db-conn)
+                               :target (create-table ',target-table-name)
                                :encoding ,encoding
                                :fields ',fields
                                :columns ',columns
                                :skip-lines ,(or (getf options :skip-line) 0))))
 
-           (pgloader.sources:copy-from source
-                                       :truncate truncate
-                                       :disable-triggers disable-triggers))
+           (copy-database source
+                          ,@ (when worker-count
+                               (list :worker-count worker-count))
+                          ,@ (when concurrency
+                               (list :concurrency concurrency))
+                          :on-error-stop on-error-stop
+                          :truncate truncate
+                          :drop-indexes drop-indexes
+                          :disable-triggers disable-triggers
+                          :max-parallel-create-index max-parallel-create-index))
 
-         ,(sql-code-block pg-db-conn 'state-after after "after load")
-
-         ;; reporting
-         (when summary
-           (report-full-summary "Total import time" *state*
-                                :before  state-before
-                                :finally state-after))))))
+         ,(sql-code-block pg-db-conn :post after "after load")))))
 
 (defrule load-fixed-cols-file load-fixed-cols-file-command
   (:lambda (command)
-    (bind (((source encoding fields pg-db-uri columns
-                    &key ((:fixed-options options)) gucs before after) command))
-      (lisp-code-for-loading-from-fixed source fields pg-db-uri
-                                        :encoding encoding
-                                        :columns columns
-                                        :gucs gucs
-                                        :before before
-                                        :after after
-                                        :fixed-options options))))
+    (bind (((source encoding fields pg-db-uri table-name columns
+                    &key options gucs before after) command))
+      (cond (*dry-run*
+             (lisp-code-for-csv-dry-run pg-db-uri))
+            (t
+             (lisp-code-for-loading-from-fixed source pg-db-uri
+                                               :encoding encoding
+                                               :fields fields
+                                               :target-table-name table-name
+                                               :columns columns
+                                               :gucs gucs
+                                               :before before
+                                               :after after
+                                               :options options))))))

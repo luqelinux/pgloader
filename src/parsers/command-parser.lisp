@@ -17,6 +17,7 @@
                           load-copy-file
 			  load-dbf-file
                           load-ixf-file
+                          load-pgsql-database
 			  load-mysql-database
                           load-mssql-database
 			  load-sqlite-database
@@ -28,20 +29,26 @@
 
 (defrule commands (+ command))
 
-(defun parse-commands (commands)
+(defun parse-commands (commands-template &key (start 0) end junk-allowed)
   "Parse a command and return a LAMBDA form that takes no parameter."
-  (parse 'commands commands))
+  (let ((commands (apply-template (subseq commands-template start end))))
+    (unless junk-allowed
+      (log-message :info "Parsed command:~%~a~%" commands))
+    (parse 'commands
+           commands
+           :start start
+           :end end
+           :junk-allowed junk-allowed)))
 
 (defun inject-inline-data-position (command position)
   "We have '(:inline nil) somewhere in command, have '(:inline position) instead."
   (loop
      :for s-exp :in command
 
-     :when (and (or (typep s-exp 'csv-connection)
-                    (typep s-exp 'fixed-connection))
-                (slot-boundp s-exp 'specs)
-                (eq :inline (first (csv-specs s-exp))))
-     :do (setf (second (csv-specs s-exp)) position)
+     :when (and (typep s-exp 'md-connection)
+                (slot-boundp s-exp 'pgloader.sources::spec)
+                (eq :inline (first (md-spec s-exp))))
+     :do (setf (second (md-spec s-exp)) position)
      :and :collect s-exp
 
      :else :collect (if (and (consp s-exp) (listp (cdr s-exp)))
@@ -67,13 +74,12 @@
                                                     filename)))
                      s-exp)
 
-                    ((and (or (typep s-exp 'csv-connection)
-                              (typep s-exp 'fixed-connection))
-                          (slot-boundp s-exp 'specs)
-                          (eq :filename (car (csv-specs s-exp))))
-                     (let ((path (second (csv-specs s-exp))))
+                    ((and (typep s-exp 'md-connection)
+                          (slot-boundp s-exp 'pgloader.sources::spec)
+                          (eq :filename (car (md-spec s-exp))))
+                     (let ((path (second (md-spec s-exp))))
                        (if (uiop:relative-pathname-p path)
-                           (progn (setf (csv-specs s-exp)
+                           (progn (setf (md-spec s-exp)
                                         `(:filename
                                           ,(uiop:merge-pathnames* path
                                                                   filename)))
@@ -102,14 +108,14 @@
          (*data-expected-inline* nil)
 	 (content (read-file-into-string filename)))
      (multiple-value-bind (commands end-commands-position)
-	 (parse 'commands content :junk-allowed t)
+	 (parse-commands content :junk-allowed t)
 
        ;; INLINE is only allowed where we have a single command in the file
        (if *data-expected-inline*
 	   (progn
 	     (when (= 0 end-commands-position)
 	       ;; didn't find any command, leave error reporting to esrap
-	       (parse 'commands content))
+	       (parse-commands content))
 
 	     (when (and *data-expected-inline*
 			(null end-commands-position))
@@ -124,13 +130,16 @@
 	     ;; now we should have a single command and inline data after that
 	     ;; replace the (:inline nil) found in the first (and only) command
 	     ;; with a (:inline position) instead
-	     (list
-	      (inject-inline-data-position
-	       (first commands) (cons filename end-commands-position))))
+             (let ((command
+                    (parse-commands content :end end-commands-position)))
+               (list
+	      (inject-inline-data-position (first command)
+                                           (cons filename
+                                                 end-commands-position)))))
 
 	   ;; There was no INLINE magic found in the file, reparse it so that
 	   ;; normal error processing happen
-	   (parse 'commands content))))))
+	   (parse-commands content))))))
 
 
 ;;;
@@ -139,7 +148,7 @@
 (defvar *data-source-filename-extensions*
   '((:csv     . ("csv" "tsv" "txt" "text"))
     (:copy    . ("copy" "dat"))         ; reject data files are .dat
-    (:sqlite  . ("sqlite" "db"))
+    (:sqlite  . ("sqlite" "db" "sqlite3"))
     (:dbf     . ("db3" "dbf"))
     (:ixf     . ("ixf"))))
 
@@ -152,12 +161,12 @@
     (declare (ignore abs paths no-path-p))
     (let ((dotted-parts (reverse (sq:split-sequence #\. filename))))
       (when (<= 2 (length dotted-parts))
-        (destructuring-bind (extension name-or-ext &rest parts)
+        (destructuring-bind (ext name-or-ext &rest parts)
             dotted-parts
           (declare (ignore parts))
           (if (string-equal "tar" name-or-ext) :archive
               (loop :for (type . extensions) :in *data-source-filename-extensions*
-                 :when (member extension extensions :test #'string-equal)
+                 :when (member ext extensions :test #'string-equal)
                  :return type)))))))
 
 (defvar *parse-rule-for-source-types*
@@ -215,13 +224,14 @@
      :collect (parse 'generic-option guc)))
 
 (defrule dbf-type-name (or "dbf" "db3") (:constant "dbf"))
+(defrule sqlite-type-name (or "sqlite3" "sqlite") (:constant "sqlite"))
 
 (defrule cli-type (or "csv"
                       "fixed"
                       "copy"
                       dbf-type-name
+                      sqlite-type-name
                       "ixf"
-                      "sqlite"
                       "mysql"
                       "mssql")
   (:text t))
@@ -229,7 +239,7 @@
 (defun parse-cli-type (type)
   "Parse the --type option"
   (when type
-   (intern (string-upcase (parse 'cli-type type)) (find-package "KEYWORD"))))
+    (intern (string-upcase (parse 'cli-type type)) (find-package "KEYWORD"))))
 
 (defun parse-cli-encoding (encoding)
   "Parse the --encoding option"
@@ -257,6 +267,7 @@
                         (:dbf    'dbf-option)
                         (:ixf    'ixf-option)
                         (:sqlite 'sqlite-option)
+                        (:pgsql  'pgsql-option)
                         (:mysql  'mysql-option)
                         (:mssql  'mysql-option))
                       option))))
@@ -271,3 +282,52 @@
   (when filename
     (log-message :notice "reading SQL queries from ~s" filename)
     (pgloader.sql:read-queries (probe-file filename))))
+
+
+;;;
+;;; Helper for regression testing
+;;;
+(defrule pg-db-uri-from-command (or pg-db-uri-from-files
+                                    pg-db-uri-from-source-target
+                                    pg-db-uri-from-source-table-target
+                                    pg-db-uri-from-source-and-encoding))
+
+(defrule pg-db-uri-from-files (or load-csv-file-command
+                                  load-copy-file-command
+                                  load-fixed-cols-file-command)
+  (:lambda (command)
+    (destructuring-bind (source encoding fields pg-db-uri table-name columns
+                                &key gucs &allow-other-keys)
+        command
+      (declare (ignore source encoding fields columns))
+      (list pg-db-uri table-name gucs))))
+
+(defrule pg-db-uri-from-source-target (or load-sqlite-command
+                                          load-mysql-command
+                                          load-mssql-command)
+  (:lambda (command)
+    (destructuring-bind (source pg-db-uri &key gucs &allow-other-keys)
+        command
+      (declare (ignore source))
+      (list pg-db-uri nil gucs))))
+
+(defrule pg-db-uri-from-source-table-target (or load-ixf-command)
+  (:lambda (command)
+    (destructuring-bind (source pg-db-uri table-name &key gucs &allow-other-keys)
+        command
+      (declare (ignore source))
+      (list pg-db-uri table-name gucs))))
+
+(defrule pg-db-uri-from-source-and-encoding (or load-dbf-command)
+  (:lambda (command)
+    (destructuring-bind (source encoding pg-db-uri table-name
+                                &key gucs &allow-other-keys)
+        command
+      (declare (ignore source encoding))
+      (list pg-db-uri table-name gucs))))
+
+(defun parse-target-pg-db-uri (command-file)
+  "Partially parse COMMAND-FILE and return its target connection string."
+  (let* ((content (read-file-into-string command-file)))
+
+    (parse 'pg-db-uri-from-command content :junk-allowed t)))

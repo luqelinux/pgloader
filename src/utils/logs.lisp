@@ -9,7 +9,8 @@
 (defcategory :error   (or :error :log))
 (defcategory :warning (or :warning :error))
 (defcategory :notice  (or :notice :warning))
-(defcategory :info    (or :info :notice))
+(defcategory :sql     (or :sql :notice))
+(defcategory :info    (or :info :sql))
 (defcategory :debug   (or :debug :info))
 (defcategory :data    (or :data :debug))
 
@@ -33,13 +34,14 @@
   (push (cl-log:start-messenger 'text-file-messenger
 				:name "logfile"
 				:filter *log-min-messages*
-				:filename log-filename)
+				:filename log-filename
+                                :external-format :utf-8)
 	*log-messengers*)
 
   (push (cl-log:start-messenger 'text-stream-messenger
 				:name "stdout"
 				:filter *client-min-messages*
-				:stream *standard-output*)
+				:stream (make-broadcast-stream *standard-output*))
 	*log-messengers*)
 
   (cl-log:log-message :notice "Starting pgloader, log system is ready."))

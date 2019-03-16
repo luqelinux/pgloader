@@ -24,7 +24,14 @@ LOAD DATABASE
       type bit when (= precision 1) to boolean drop typemod using bits-to-boolean,
 
       column ascii.s using byte-vector-to-bytea,
-      column enumerate.foo using empty-string-to-null
+      column enumerate.foo using empty-string-to-null,
+
+      column ip.ip_address to inet keep not null drop typemod,
+
+      type decimal when (= precision 1) to boolean drop typemod,
+
+      -- type varbinary to text drop typemod using babel:octets-to-string
+      type varbinary to text drop typemod using varbinary-to-string
 
  MATERIALIZE VIEWS nonexisting,
    d as $$

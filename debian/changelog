@@ -1,3 +1,78 @@
+pgloader (3.6.1-1) unstable; urgency=medium
+
+  * New upstream version.
+  * SSL is always enabled now, drop our patch.
+  * Add B-D on python3-sphinx-rtd-theme.
+
+ -- Christoph Berg <christoph.berg@credativ.de>  Mon, 21 Jan 2019 16:09:17 +0100
+
+pgloader (3.5.2-3) unstable; urgency=medium
+
+  * Make cl-pgloader test depend on ca-certificates so the snakeoil
+    certificate is recognized as a valid CA. (Needs the /etc/ssl/certs/*.0
+    file.)
+
+ -- Christoph Berg <christoph.berg@credativ.de>  Tue, 31 Jul 2018 16:24:03 +0200
+
+pgloader (3.5.2-2) unstable; urgency=medium
+
+  * Install pgloader.asd into correct location. (Closes: #857226)
+  * Test cl-pgloader through sbcl --eval.
+  * Skip building and manpage generation in arch-indep builds.
+
+ -- Christoph Berg <myon@debian.org>  Tue, 03 Jul 2018 22:51:48 +0200
+
+pgloader (3.5.2-1) unstable; urgency=medium
+
+  * New upstream version.
+  * All included test data has been verified as free, stop building a +dfsg
+    tarball.
+  * debian/source/options: Ignore changes in src/params.lisp (release vs
+    non-release).
+  * Enable SSL in src/hooks.lisp.
+  * Run wrap-and-sort -st.
+  * Add new B-D cl-mustache, cl-yason, cl-zs3, sync Depends to cl-pgloader.
+  * Depend on the libssl version cl-plus-ssl depends on. (Closes: #864309)
+  * Build and install new sphinx docs instead.
+  * Build manpage using help2man.
+  * Priority: optional, move cl-pgloader to Section: lisp.
+  * Update S-V.
+  * Add watch file.
+
+ -- Christoph Berg <christoph.berg@credativ.de>  Tue, 03 Jul 2018 16:59:07 +0200
+
+pgloader (3.4.1+dfsg-1) unstable; urgency=medium
+
+  * New release, bugfixes and new features
+
+ -- Dimitri Fontaine <dim@tapoueh.org>  Thu, 06 Jul 2017 16:51:53 +0300
+
+pgloader (3.3.2+dfsg-1) unstable; urgency=medium
+
+  * Fixes github issue 453 (Closes: #843555)
+  * Maintenance release.
+
+ -- Dimitri Fontaine <dim@tapoueh.org>  Sat, 03 Dec 2016 19:36:56 +0300
+
+pgloader (3.3.1+dfsg-2) unstable; urgency=medium
+
+  * Add tzdata to build-depends (Closes: #839468)
+
+ -- Christoph Berg <christoph.berg@credativ.de>  Thu, 03 Nov 2016 14:32:28 +0100
+
+pgloader (3.3.1+dfsg-1) unstable; urgency=medium
+
+  * New release, bugfixes and new features
+
+ -- Dimitri Fontaine <dim@tapoueh.org>  Sun, 28 Aug 2016 21:07:47 +0300
+
+pgloader (3.2.2+dfsg-1) unstable; urgency=medium
+
+  * New release, lots of bugfixes, some new features
+  * New build dependencies
+
+ -- Dimitri Fontaine <dim@tapoueh.org>  Thu, 03 Sep 2015 19:17:12 +0300
+
 pgloader (3.2.1~preview+dfsg-2) unstable; urgency=medium
 
   * Interim bugfix release

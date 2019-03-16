@@ -2,7 +2,7 @@
 ;;; Tools to handle the SQLite Database
 ;;;
 
-(in-package :pgloader.sqlite)
+(in-package :pgloader.source.sqlite)
 
 (defvar *sqlite-db* nil
   "The SQLite database connection handler.")
@@ -15,7 +15,13 @@
     (:source (:type "nchar")     :target (:type "text" :drop-typemod t))
     (:source (:type "clob")      :target (:type "text" :drop-typemod t))
 
-    (:source (:type "tinyint") :target (:type "smallint"))
+    (:source (:type "integer" :auto-increment t) :target (:type "bigserial"))
+
+    (:source (:type "tinyint") :target (:type "smallint")
+             :using pgloader.transforms::integer-to-string)
+
+    (:source (:type "integer") :target (:type "bigint")
+             :using pgloader.transforms::integer-to-string)
 
     (:source (:type "float") :target (:type "float")
              :using pgloader.transforms::float-to-string)
@@ -26,7 +32,10 @@
     (:source (:type "double") :target (:type "double precision")
              :using pgloader.transforms::float-to-string)
 
-    (:source (:type "numeric") :target (:type "numeric")
+    (:source (:type "numeric") :target (:type "numeric" :drop-typemod nil)
+             :using pgloader.transforms::float-to-string)
+
+    (:source (:type "decimal") :target (:type "decimal" :drop-typemod nil)
              :using pgloader.transforms::float-to-string)
 
     (:source (:type "blob") :target (:type "bytea")
@@ -46,48 +55,60 @@
 	     (:constructor make-coldef (table-name
                                         seq name dtype ctype
                                         nullable default pk-id)))
-  table-name seq name dtype ctype nullable default pk-id)
+  table-name seq name dtype ctype nullable default pk-id extra)
 
 (defun normalize (sqlite-type-name)
   "SQLite only has a notion of what MySQL calls column_type, or ctype in the
    CAST machinery. Transform it to the data_type, or dtype."
-  (let* ((sqlite-type-name (string-downcase sqlite-type-name))
-         (tokens (remove-if (lambda (token)
-                              (member token '("unsigned" "short"
-                                              "varying" "native")
-                                      :test #'string-equal))
-                            (sq:split-sequence #\Space sqlite-type-name))))
-    (assert (= 1 (length tokens)))
-    (first tokens)))
+  (multiple-value-bind (type-name typmod extra-noise-words)
+      (pgloader.parser:parse-sqlite-type-name sqlite-type-name)
+    (declare (ignore extra-noise-words))
+    (if typmod
+        (format nil "~a(~a~@[,~a~])" type-name (car typmod) (cdr typmod))
+        type-name)))
 
 (defun ctype-to-dtype (sqlite-type-name)
   "In SQLite we only get the ctype, e.g. int(7), but here we want the base
    data type behind it, e.g. int."
-  (let* ((ctype     (normalize sqlite-type-name))
-         (paren-pos (position #\( ctype)))
-    (if paren-pos (subseq ctype 0 paren-pos) ctype)))
+  ;; parse-sqlite-type-name returns multiple values, here we only need the
+  ;; first one: (type-name typmod extra-noise-words)
+  (pgloader.parser:parse-sqlite-type-name sqlite-type-name))
 
-(defun cast-sqlite-column-definition-to-pgsql (sqlite-column)
-  "Return the PostgreSQL column definition from the MySQL one."
-  (multiple-value-bind (column fn)
-      (with-slots (table-name name dtype ctype default nullable)
-          sqlite-column
-        (cast table-name name dtype ctype default nullable nil))
-    ;; the SQLite driver smartly maps data to the proper CL type, but the
-    ;; pgloader API only wants to see text representations to send down the
-    ;; COPY protocol.
-    (values column (or fn (lambda (val) (if val (format nil "~a" val) :null))))))
+(defmethod cast ((col coldef) &key &allow-other-keys)
+  "Return the PostgreSQL type definition from given SQLite column definition."
+  (with-slots (table-name name dtype ctype default nullable extra)
+      col
+    (let ((pgcol
+           (apply-casting-rules table-name name dtype ctype default nullable extra)))
+      ;; the SQLite driver smartly maps data to the proper CL type, but the
+      ;; pgloader API only wants to see text representations to send down
+      ;; the COPY protocol.
+      (unless (column-transform pgcol)
+        (setf (column-transform pgcol)
+              (lambda (val) (if val (format nil "~a" val) :null))))
 
-(defmethod cast-to-bytea-p ((col coldef))
-  "Returns a generalized boolean, non-nil when the column is casted to a
-   PostgreSQL bytea column."
-  (string= "bytea" (cast-sqlite-column-definition-to-pgsql col)))
+      ;; normalize default values that comes from the casting rules
+      ;; (respecting user cast decision to "drop default" or "keep default")
+      (let ((default (column-default pgcol)))
+        (setf (column-default pgcol)
+              (cond
+                ((and (stringp default) (string= "NULL" default))
+                 :null)
 
-(defmethod format-pgsql-column ((col coldef))
-  "Return a string representing the PostgreSQL column definition."
-  (let* ((column-name (apply-identifier-case (coldef-name col)))
-	 (type-definition
-          (with-slots (table-name name dtype ctype nullable default)
-              col
-            (cast table-name name dtype ctype default nullable nil))))
-    (format nil "~a ~22t ~a" column-name type-definition)))
+                ((and (stringp default)
+                      ;; address CURRENT_TIMESTAMP(6) and other spellings
+                      (or (uiop:string-prefix-p "CURRENT_TIMESTAMP" default)
+                          (string= "CURRENT TIMESTAMP" default)))
+                 :current-timestamp)
+
+                ((and (stringp default) (string-equal "current_date" default))
+                 :current-date)
+
+                ((stringp default)
+                 ;; at least quote the single quotes in there
+                 (cl-ppcre:regex-replace-all "[']" default "''"))
+
+                (t (column-default pgcol)))))
+
+      pgcol)))
+

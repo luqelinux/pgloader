@@ -25,7 +25,7 @@
 (defrule doubled-at-sign (and "@@") (:constant "@"))
 (defrule doubled-colon   (and "::") (:constant ":"))
 (defrule password (+ (or (not "@") doubled-at-sign)) (:text t))
-(defrule username (and (or #\_ (alpha-char-p character))
+(defrule username (and (or #\_ (alpha-char-p character) (digit-char-p character))
                        (* (or (alpha-char-p character)
                               (digit-char-p character)
                               #\.
@@ -60,7 +60,8 @@
   (or (member char #.(quote (coerce "/.-_" 'list)))
       (alphanumericp char)))
 
-(defrule socket-directory (and "unix:" (* (socket-directory-character-p character)))
+(defrule socket-directory (and "unix:"
+                               (* (or (not ":") doubled-colon)))
   (:destructure (unix socket-directory)
 		(declare (ignore unix))
     (list :unix (when socket-directory (text socket-directory)))))
@@ -73,22 +74,24 @@
 (defrule hostname (or ipv4 socket-directory network-name)
   (:identity t))
 
+(defun process-hostname (hostname)
+  (destructuring-bind (type &optional name) hostname
+    (ecase type
+      (:unix  (if name (cons :unix name) :unix))
+      (:ipv4  name)
+      (:host  name))))
+
 (defrule dsn-hostname (and (? hostname) (? dsn-port))
   (:lambda (host-port)
     (destructuring-bind (host &optional port) host-port
-      (append (list :host
-                    (when host
-                      (destructuring-bind (type &optional name) host
-                        (ecase type
-                          (:unix  (if name (cons :unix name) :unix))
-                          (:ipv4  name)
-                          (:host  name)))))
+      (append (list :host (when host (process-hostname host)))
               port))))
 
-(defrule dsn-dbname (and "/" (? namestring))
-  (:destructure (slash dbname)
-		(declare (ignore slash))
-		(list :dbname dbname)))
+(defrule dsn-dbname (and "/" (? (* (or (alpha-char-p character)
+                                       (digit-char-p character)
+                                       punct))))
+  (:lambda (dbn)
+    (list :dbname (text (second dbn)))))
 
 (defrule dsn-option-ssl-disable "disable" (:constant :no))
 (defrule dsn-option-ssl-allow   "allow"   (:constant :try))
@@ -104,19 +107,25 @@
       (declare (ignore key e))
       (cons :use-ssl val))))
 
-(defrule maybe-quoted-namestring (or double-quoted-namestring
-                                     quoted-namestring
-                                     namestring))
+(defun get-pgsslmode (&optional (env-var-name "PGSSLMODE") default)
+  "Get PGSSLMODE from the environment."
+  (let ((pgsslmode (getenv-default env-var-name default)))
+    (when pgsslmode
+      (cdr (parse 'dsn-option-ssl (format nil "sslmode=~a" pgsslmode))))))
 
 (defrule qualified-table-name (and maybe-quoted-namestring
                                    "."
                                    maybe-quoted-namestring)
   (:destructure (schema dot table)
     (declare (ignore dot))
-    (format nil "~a.~a" (text schema) (text table))))
+    (cons (text schema) (text table))))
 
 (defrule dsn-table-name (or qualified-table-name maybe-quoted-namestring)
   (:lambda (name)
+    ;; we can't make a table instance yet here, because for that we need to
+    ;; apply-identifier-case on it, and that requires to have initialized
+    ;; the *pgsql-reserved-keywords*, and we can't do that before parsing
+    ;; the target database connection string, can we?
     (cons :table-name name)))
 
 (defrule dsn-option-table-name (and (? (and "tablename" "="))
@@ -125,7 +134,39 @@
     (bind (((_ table-name) opt-tn))
       table-name)))
 
-(defrule dsn-option (or dsn-option-ssl dsn-option-table-name))
+(defrule uri-param (+ (not "&")) (:text t))
+
+(defmacro make-dsn-option-rule (name param &optional (rule 'uri-param) fn)
+  `(defrule ,name (and ,param "=" ,rule)
+     (:lambda (x)
+       (let ((cons (first (quri:url-decode-params (text x)))))
+         (setf (car cons) (intern (string-upcase (car cons)) "KEYWORD"))
+         (when ,fn
+           (setf (cdr cons) (funcall ,fn (cdr cons))))
+         cons))))
+
+(make-dsn-option-rule dsn-option-host   "host" uri-param
+                      (lambda (hostname)
+                        (process-hostname
+                         (parse 'hostname
+                                ;; special case Unix Domain Socket paths
+                                (cond ((char= (aref hostname 0) #\/)
+                                       (format nil "unix:~a" hostname))
+                                      (t hostname))))))
+(make-dsn-option-rule dsn-option-port   "port"
+                      (+ (digit-char-p character))
+                      #'parse-integer)
+(make-dsn-option-rule dsn-option-dbname "dbname")
+(make-dsn-option-rule dsn-option-user   "user")
+(make-dsn-option-rule dsn-option-pass   "password")
+
+(defrule dsn-option (or dsn-option-ssl
+                        dsn-option-host
+                        dsn-option-port
+                        dsn-option-dbname
+                        dsn-option-user
+                        dsn-option-pass
+                        dsn-option-table-name))
 
 (defrule another-dsn-option (and "&" dsn-option)
   (:lambda (source)
@@ -154,36 +195,42 @@
 			      dbname
                               table-name
                               use-ssl)
-        (apply #'append uri)
+        ;; we want the options to take precedence over the URI components,
+        ;; so we destructure the URI again and prepend options here.
+        (destructuring-bind (prefix user-pass host-port dbname options) uri
+          (apply #'append options prefix user-pass host-port (list dbname)))
       ;; Default to environment variables as described in
       ;;  http://www.postgresql.org/docs/9.3/static/app-psql.html
       (declare (ignore type))
-      (make-instance 'pgsql-connection
-                     :user (or user
-                               (getenv-default "PGUSER"
-                                               #+unix (getenv-default "USER")
-                                               #-unix (getenv-default "UserName")))
-                     :pass (or password (getenv-default "PGPASSWORD"))
-                     :host (or host     (getenv-default "PGHOST"
-                                                        #+unix :unix
-                                                        #-unix "localhost"))
-                     :port (or port     (parse-integer
-                                         (getenv-default "PGPORT" "5432")))
-                     :name (or dbname   (getenv-default "PGDATABASE" user))
+      (let ((pgconn
+             (make-instance 'pgsql-connection
+                            :user (or user
+                                      (getenv-default "PGUSER"
+                                                      #+unix
+                                                      (getenv-default "USER")
+                                                      #-unix
+                                                      (getenv-default "UserName")))
+                            :host (or host     (getenv-default "PGHOST"
+                                                               #+unix :unix
+                                                               #-unix "localhost"))
+                            :port (or port     (parse-integer
+                                                (getenv-default "PGPORT" "5432")))
+                            :name (or dbname   (getenv-default "PGDATABASE" user))
 
-                     :use-ssl use-ssl
-                     :table-name table-name))))
+                            :use-ssl (or use-ssl (get-pgsslmode "PGSSLMODE"))
+                            :table-name table-name)))
+        ;; Now set the password, maybe from ~/.pgpass
+        (setf (db-pass pgconn)
+              (or password
+                  (getenv-default "PGPASSWORD")
+                  (match-pgpass-file (db-host pgconn)
+                                     (princ-to-string (db-port pgconn))
+                                     (db-name pgconn)
+                                     (db-user pgconn))))
+        ;; And return our pgconn instance
+        pgconn))))
 
-(defrule get-pgsql-uri-from-environment-variable (and kw-getenv name)
-  (:lambda (p-e-v)
-    (bind (((_ varname) p-e-v))
-      (let ((connstring (getenv-default varname)))
-        (unless connstring
-          (error "Environment variable ~s is unset." varname))
-        (parse 'pgsql-uri connstring)))))
-
-(defrule target (and kw-into (or pgsql-uri
-                                 get-pgsql-uri-from-environment-variable))
+(defrule target (and kw-into pgsql-uri)
   (:destructure (into target)
     (declare (ignore into))
     target))
@@ -191,7 +238,7 @@
 
 (defun pgsql-connection-bindings (pg-db-uri gucs)
   "Generate the code needed to set PostgreSQL connection bindings."
-  `((*pg-settings* ',gucs)
-    (pgloader.pgsql::*pgsql-reserved-keywords*
+  `((*pg-settings* (pgloader.pgsql:sanitize-user-gucs ',gucs))
+    (*pgsql-reserved-keywords*
      (pgloader.pgsql:list-reserved-keywords ,pg-db-uri))))
 
